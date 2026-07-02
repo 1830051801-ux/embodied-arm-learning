@@ -1,0 +1,15 @@
+.venv/
+.venv_train/
+__pycache__/
+*.pyc
+
+outputs/
+runs/
+wandb/
+
+*.zip
+*.rar
+*.7z
+
+.DS_Store
+Thumbs.db

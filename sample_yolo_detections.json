@@ -1,0 +1,21 @@
+{
+  "image_size": [640, 480],
+  "detections": [
+    {
+      "class_name": "bottle",
+      "confidence": 0.91,
+      "bbox": [430, 220, 500, 370]
+    },
+    {
+      "class_name": "cup",
+      "confidence": 0.86,
+      "bbox": [250, 170, 330, 300]
+    },
+    {
+      "class_name": "box",
+      "confidence": 0.78,
+      "bbox": [80, 260, 200, 420]
+    }
+  ]
+}
+

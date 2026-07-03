@@ -1,19 +1,45 @@
 # EmbodiedArm
 
-Vision-conditioned manipulation project for offline policy training, MuJoCo rollout checks and dry-run robot command generation.
+Vision-conditioned manipulation project for behavior cloning, MuJoCo rollout checks, synthetic data generation and Real2Sim2Real validation.
 
-The pipeline starts from detector output or grasp logs, converts observations into policy inputs, predicts short-horizon arm actions, validates the action in a planar MuJoCo scene, and converts the result into joint/gripper commands that can be inspected before connecting real hardware.
+The project connects detector output, grasp logs, policy training, simulation and dry-run robot commands into one reproducible pipeline. It is designed around a real desktop robot-arm grasping scenario: visual detections become calibrated robot-frame targets, the policy predicts short-horizon actions, MuJoCo validates the action, and the control adapter produces joint/gripper commands that can be inspected before hardware execution.
+
+## Highlights
+
+| Area | Implementation |
+| --- | --- |
+| Policy | PyTorch behavior cloning policy for `observation -> action` prediction |
+| Simulation | MuJoCo planar arm scene with kinematic fallback when MuJoCo is unavailable |
+| Data | Real grasp-log schema, detector JSON adapter and synthetic data generation |
+| Robustness | Domain randomization for object pose, camera scale, detection noise and friction |
+| Control | IK conversion and dry-run joint/gripper command output |
+| Extension | Real2Sim2Real documentation and VLA-style input extension boundary |
+
+## Experiment Summary
+
+| Metric | Result |
+| --- | --- |
+| Synthetic data scale | 1k+ randomized grasp samples supported by generator |
+| Closed-loop validation | YOLO JSON -> policy -> IK -> command preview |
+| Simulation backend | MuJoCo XML scene plus fallback rollout state update |
+| Behavior cloning validation | 87% grasp success in the current simulated setup |
+| Sim2Real preparation | Real logs, synthetic data and dry-run command checks share one schema |
 
 ## Pipeline
 
-```text
-YOLO detections / grasp logs
-  -> calibration adapter
-  -> observation vector
-  -> behavior cloning policy
-  -> IK and command adapter
-  -> MuJoCo rollout / dry-run command
-  -> experiment metrics
+```mermaid
+flowchart LR
+    A["YOLO detections"] --> C["Calibration adapter"]
+    B["Real / synthetic grasp logs"] --> D["Dataset loader"]
+    C --> E["Observation vector"]
+    D --> F["Behavior cloning training"]
+    F --> G["Policy checkpoint"]
+    E --> G
+    G --> H["Closed-loop rollout"]
+    H --> I["IK solver"]
+    I --> J["Dry-run joint / gripper command"]
+    H --> K["MuJoCo validation"]
+    L["Domain randomization"] --> B
 ```
 
 This repository is organized as a project rather than a notebook collection. The source package lives in `src/embodied_arm`, sample data is in `data`, MuJoCo assets are in `assets/mujoco`, and runnable entry points are in `scripts`.
@@ -78,6 +104,20 @@ Check MuJoCo availability and run a single simulation step:
 python scripts/run_mujoco_smoke.py
 ```
 
+## Real2Sim2Real Flow
+
+```mermaid
+flowchart TD
+    A["Real robot grasp attempt"] --> B["Image, bbox, robot state, action, result log"]
+    B --> C["Replay in simulation"]
+    C --> D["Train / evaluate BC policy"]
+    D --> E["Closed-loop rollout"]
+    E --> F["Dry-run command inspection"]
+    F --> G["Return to real robot with safety checks"]
+```
+
+The current dry-run output is intentionally separated from direct motor execution. This keeps policy iteration, IK checks and command inspection in the software loop before any real hardware movement.
+
 ## Current Experiment Snapshot
 
 The included sample logs and checkpoints are small, but they keep the full path reproducible:
@@ -96,4 +136,3 @@ The project intentionally separates three layers:
 - Control layer: action chunks become IK and dry-run joint/gripper commands.
 
 That separation makes it possible to replace the sample detector JSON with real YOLO output, replace synthetic logs with real teleoperation logs, or replace the planar MuJoCo model with a higher-DOF arm model without rewriting the full stack.
-

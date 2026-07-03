@@ -118,6 +118,17 @@ flowchart TD
 
 The current dry-run output is intentionally separated from direct motor execution. This keeps policy iteration, IK checks and command inspection in the software loop before any real hardware movement.
 
+## Embodied Data Pyramid
+
+The training data is organized as a two-layer dataset that can be expanded as more real robot attempts are collected:
+
+| Layer | Source | Usage |
+| --- | --- | --- |
+| Real robot data | Camera frame, bbox, target coordinate, action command, gripper state, success flag | Replay, policy validation and failure analysis |
+| Synthetic simulation data | Domain-randomized object pose, camera scale, detection noise and physical parameters | BC training, robustness checks and Sim2Real pre-training |
+
+Both layers keep the same grasp-log schema so the policy and evaluation scripts can switch between real, synthetic or mixed datasets without changing model code.
+
 ## Current Experiment Snapshot
 
 The included sample logs and checkpoints are small, but they keep the full path reproducible:

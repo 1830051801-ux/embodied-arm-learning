@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "embodied-arm"
+version = "0.1.0"
+description = "Vision-conditioned manipulation simulation and behavior cloning pipeline"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "numpy",
+  "mujoco",
+  "pyyaml",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

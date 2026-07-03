@@ -1,0 +1,24 @@
+dataset: data/sample_grasp_log.csv
+detections: data/sample_yolo_detections.json
+model_out: models/bc_policy.pt
+pretrained_model: models/robot_policy_from_csv.pt
+scene_xml: assets/mujoco/planar_grasp_scene.xml
+training:
+  epochs: 120
+  batch_size: 64
+  learning_rate: 0.001
+robot:
+  link1_m: 0.32
+  link2_m: 0.28
+  workspace_radius_m:
+    min: 0.12
+    max: 0.58
+camera:
+  width: 640
+  height: 480
+domain_randomization:
+  object_x_m: [0.18, 0.48]
+  object_y_m: [-0.22, 0.22]
+  camera_scale: [0.96, 1.04]
+  detection_noise_px: [0.0, 3.0]
+  friction: [0.55, 1.15]

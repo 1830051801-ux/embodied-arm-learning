@@ -1,3 +1,0 @@
-episode_id,step,timestamp,object_type,confidence,bbox_x1,bbox_y1,bbox_x2,bbox_y2,object_x,object_y,hand_x,hand_y,move_dx,move_dy,gripper_width,q1_deg,q2_deg,dry_run_command,success,failure_reason
-episode_0001,0,1782947910,bottle,0.91,430,220,500,370,0.2719,-0.0917,0.0,0.0,0.1234,-0.0441,0.0344,-52.39,163.53,J -52.39 163.53 G 34.4,,
-episode_0001,1,1782947911,bottle,0.91,430,220,500,370,0.2719,-0.0917,0.1234,-0.0441,0.0668,-0.024,0.0344,-45.2,151.1,J -45.20 151.10 G 34.4,true,

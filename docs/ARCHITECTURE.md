@@ -28,13 +28,12 @@ The action vector is:
 
 ## Policy
 
-`embodied_arm.policy.BCPolicy` is a compact MLP behavior cloning policy. The training entry point is `scripts/train_policy.py`; evaluation is `scripts/evaluate_policy.py`.
+`embodied_arm.policy.BCPolicy` is a compact MLP behavior cloning policy. `scripts/train_policy.py` builds a checkpoint from grasp logs; `scripts/evaluate_policy.py` checks it against held-out samples.
 
 The current implementation is small enough to inspect, but the package boundary supports replacing it with action chunking, diffusion policy, ACT-style sequence prediction, or a VLA command adapter later.
 
 ## Simulation and Control
 
-`assets/mujoco/planar_grasp_scene.xml` defines a planar two-link arm, table and target block. `embodied_arm.sim_env.PlanarArmSim` uses MuJoCo when available and falls back to kinematic state updates when MuJoCo is not installed.
+`assets/mujoco/arm6_grasp_scene.xml` defines a 6-DoF tabletop arm, table, target block, distractor object, camera and position actuators. `embodied_arm.sim_env.ArmManipulationSim` uses MuJoCo when available and falls back to kinematic state updates when MuJoCo is not installed.
 
 `embodied_arm.ik` converts Cartesian actions to joint angles. `embodied_arm.controller` builds dry-run commands for inspection before hardware connection.
-

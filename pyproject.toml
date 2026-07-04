@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "embodied-arm"
 version = "0.1.0"
-description = "Vision-conditioned manipulation simulation and behavior cloning pipeline"
+description = "Vision-conditioned tabletop manipulation platform for simulation, data generation and policy validation"
 requires-python = ">=3.10"
 dependencies = [
   "torch",
@@ -16,4 +16,3 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

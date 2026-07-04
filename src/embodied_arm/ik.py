@@ -11,7 +11,7 @@ class JointCommand:
     gripper_width: float
 
 
-def planar_ik(x: float, y: float, link1: float = 0.32, link2: float = 0.28) -> tuple[float, float]:
+def solve_reach_ik(x: float, y: float, link1: float = 0.32, link2: float = 0.28) -> tuple[float, float]:
     radius = max(1e-6, min(link1 + link2 - 1e-6, math.hypot(x, y)))
     cos_elbow = (radius * radius - link1 * link1 - link2 * link2) / (2.0 * link1 * link2)
     cos_elbow = max(-1.0, min(1.0, cos_elbow))
@@ -23,6 +23,5 @@ def planar_ik(x: float, y: float, link1: float = 0.32, link2: float = 0.28) -> t
 def action_to_joint_command(hand_x: float, hand_y: float, action: list[float]) -> JointCommand:
     target_x = hand_x + action[0]
     target_y = hand_y + action[1]
-    shoulder, elbow = planar_ik(target_x, target_y)
+    shoulder, elbow = solve_reach_ik(target_x, target_y)
     return JointCommand(shoulder_deg=shoulder, elbow_deg=elbow, gripper_width=action[2])
-

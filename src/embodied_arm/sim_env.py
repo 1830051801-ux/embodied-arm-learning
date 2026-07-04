@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-from .ik import planar_ik
+from .ik import solve_reach_ik
 
 
 @dataclass
@@ -24,10 +24,10 @@ class SimStep:
     distance: float
 
 
-class PlanarArmSim:
-    """Small MuJoCo-backed planar arm environment with a kinematic fallback."""
+class ArmManipulationSim:
+    """MuJoCo-backed tabletop arm environment with a kinematic fallback."""
 
-    def __init__(self, model_path: str | Path = "assets/mujoco/planar_grasp_scene.xml"):
+    def __init__(self, model_path: str | Path = "assets/mujoco/arm6_grasp_scene.xml"):
         self.model_path = Path(model_path)
         self.object_x = 0.36
         self.object_y = 0.10
@@ -72,9 +72,13 @@ class PlanarArmSim:
         self.hand_x += float(action[0])
         self.hand_y += float(action[1])
         if self.has_mujoco:
-            shoulder, elbow = planar_ik(self.hand_x, self.hand_y)
-            self._data.ctrl[0] = math.radians(shoulder)
-            self._data.ctrl[1] = math.radians(elbow)
+            shoulder, elbow = solve_reach_ik(self.hand_x, self.hand_y)
+            self._data.ctrl[0] = math.atan2(self.hand_y, max(1e-6, self.hand_x))
+            self._data.ctrl[1] = math.radians(shoulder)
+            self._data.ctrl[2] = math.radians(elbow)
+            self._data.ctrl[3] = -0.35
+            self._data.ctrl[4] = 0.0
+            self._data.ctrl[5] = 0.0
             for _ in range(10):
                 self._mujoco.mj_step(self._model, self._data)
 
@@ -82,4 +86,3 @@ class PlanarArmSim:
         done = distance < 0.025
         reward = -distance + (1.0 if done else 0.0)
         return SimStep(observation=self.observe(), reward=reward, done=done, distance=distance)
-

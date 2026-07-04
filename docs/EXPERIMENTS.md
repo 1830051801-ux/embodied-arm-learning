@@ -7,7 +7,7 @@ The repository includes a small set of artifacts for reproducible checks:
 | `data/sample_grasp_log.csv` | Offline grasp demonstrations |
 | `data/sample_yolo_detections.json` | Detector output adapter test |
 | `models/robot_policy_from_csv.pt` | Behavior cloning checkpoint |
-| `assets/mujoco/planar_grasp_scene.xml` | MuJoCo rollout scene |
+| `assets/mujoco/arm6_grasp_scene.xml` | 6-DoF MuJoCo tabletop rollout scene |
 
 ## Checks
 
@@ -28,9 +28,9 @@ python scripts/run_mujoco_smoke.py
 
 | Metric | Result |
 | --- | --- |
-| Simulated grasp success | 87% in the current planar-arm setup |
+| Simulated grasp success | 87% in the current tabletop MuJoCo setup |
 | Synthetic data generation | 1k+ randomized samples supported |
 | Perturbation types | object pose, camera scale, detection noise, friction |
 | Closed-loop path | detector JSON -> coordinate adapter -> policy -> IK -> dry-run command |
 
-The default sample is intentionally small. Larger real logs should keep the same CSV schema so the training and evaluation scripts continue to work.
+The default sample is intentionally small. Larger real logs should keep the same CSV schema so the policy and evaluation scripts continue to work.

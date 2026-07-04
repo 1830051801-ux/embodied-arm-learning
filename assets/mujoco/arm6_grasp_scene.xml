@@ -1,0 +1,64 @@
+<mujoco model="embodied_arm_6dof_grasp_scene">
+  <compiler angle="degree" coordinate="local"/>
+  <option timestep="0.005" gravity="0 0 -9.81"/>
+
+  <default>
+    <joint damping="0.35" armature="0.02"/>
+    <geom friction="0.9 0.1 0.1" rgba="0.55 0.58 0.62 1"/>
+  </default>
+
+  <worldbody>
+    <light name="key_light" pos="0.2 -0.5 1.4" dir="-0.1 0.3 -1"/>
+    <camera name="overhead" pos="0.42 -0.62 0.78" xyaxes="1 0.25 0 -0.10 0.38 0.92"/>
+    <geom name="table" type="box" size="0.62 0.38 0.025" pos="0.35 0 0" rgba="0.20 0.22 0.25 1"/>
+
+    <body name="base" pos="0 0 0.055">
+      <geom name="base_link" type="cylinder" size="0.065 0.055" rgba="0.08 0.09 0.11 1"/>
+      <body name="shoulder_link" pos="0 0 0.055">
+        <joint name="joint_1_yaw" type="hinge" axis="0 0 1" range="-170 170" limited="true"/>
+        <geom type="capsule" fromto="0 0 0 0.00 0.00 0.15" size="0.026" rgba="0.12 0.29 0.55 1"/>
+        <body name="upper_arm" pos="0 0 0.15">
+          <joint name="joint_2_shoulder" type="hinge" axis="0 1 0" range="-85 110" limited="true"/>
+          <geom type="capsule" fromto="0 0 0 0.22 0 0.02" size="0.022" rgba="0.16 0.45 0.74 1"/>
+          <body name="forearm" pos="0.22 0 0.02">
+            <joint name="joint_3_elbow" type="hinge" axis="0 1 0" range="-120 120" limited="true"/>
+            <geom type="capsule" fromto="0 0 0 0.20 0 -0.02" size="0.020" rgba="0.18 0.55 0.34 1"/>
+            <body name="wrist_1" pos="0.20 0 -0.02">
+              <joint name="joint_4_wrist_pitch" type="hinge" axis="0 1 0" range="-120 120" limited="true"/>
+              <geom type="capsule" fromto="0 0 0 0.08 0 0" size="0.016" rgba="0.80 0.55 0.20 1"/>
+              <body name="wrist_2" pos="0.08 0 0">
+                <joint name="joint_5_wrist_roll" type="hinge" axis="1 0 0" range="-180 180" limited="true"/>
+                <geom type="capsule" fromto="0 0 0 0.05 0 0" size="0.014" rgba="0.80 0.55 0.20 1"/>
+                <body name="tool_flange" pos="0.05 0 0">
+                  <joint name="joint_6_tool_yaw" type="hinge" axis="0 0 1" range="-180 180" limited="true"/>
+                  <geom type="box" size="0.022 0.018 0.018" rgba="0.12 0.12 0.13 1"/>
+                  <site name="tcp" pos="0.045 0 0" size="0.014" rgba="1 0.32 0.10 1"/>
+                  <geom name="left_finger" type="box" size="0.045 0.006 0.012" pos="0.045 0.026 0" rgba="0.86 0.80 0.68 1"/>
+                  <geom name="right_finger" type="box" size="0.045 0.006 0.012" pos="0.045 -0.026 0" rgba="0.86 0.80 0.68 1"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <body name="target_block" pos="0.36 0.10 0.055">
+      <joint name="target_free" type="free"/>
+      <geom type="box" size="0.035 0.035 0.035" rgba="0.88 0.27 0.16 1"/>
+    </body>
+    <body name="distractor_cylinder" pos="0.25 -0.16 0.05">
+      <geom type="cylinder" size="0.025 0.04" rgba="0.25 0.58 0.82 1"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <position name="joint_1_pos" joint="joint_1_yaw" kp="35"/>
+    <position name="joint_2_pos" joint="joint_2_shoulder" kp="35"/>
+    <position name="joint_3_pos" joint="joint_3_elbow" kp="28"/>
+    <position name="joint_4_pos" joint="joint_4_wrist_pitch" kp="18"/>
+    <position name="joint_5_pos" joint="joint_5_wrist_roll" kp="12"/>
+    <position name="joint_6_pos" joint="joint_6_tool_yaw" kp="12"/>
+  </actuator>
+</mujoco>
+

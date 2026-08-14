@@ -1,5 +1,7 @@
-torch
+requests
+python-dotenv
+sounddevice
+soundfile
 numpy
-mujoco
-pyyaml
-
+edge-tts
+PyYAML

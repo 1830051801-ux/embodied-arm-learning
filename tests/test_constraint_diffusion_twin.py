@@ -22,11 +22,15 @@ from constraint_diffusion_twin import (
     TASK_NAMES,
     TASK_PHASE_IDS,
     TRAJECTORY_STEPS,
+    balanced_episode_subset,
     build_expert_trajectory,
     build_task_trajectory,
     counterfactual_sensor_scales,
+    fuse_pose_belief,
     pose_to_context,
     rigidify_pose,
+    rotation_z,
+    synthesize_multiview_observations,
 )
 
 
@@ -96,6 +100,60 @@ class ConstraintDiffusionTwinTests(unittest.TestCase):
         self.assertAlmostEqual(xy_sigma_m, 0.0015, places=7)
         self.assertGreaterEqual(z_sigma_m, 0.0005)
         self.assertGreater(yaw_sigma_rad, 0.0)
+
+    def test_robust_pose_belief_rejects_a_large_translation_and_yaw_outlier(self) -> None:
+        def observed(x_offset: float, yaw_rad: float) -> np.ndarray:
+            pose = np.eye(4)
+            pose[:3, :3] = rotation_z(yaw_rad)
+            pose[:3, 3] = [0.25 + x_offset, -0.12, 0.30]
+            return pose
+
+        belief = fuse_pose_belief(
+            (
+                observed(0.000, 0.000),
+                observed(0.001, 0.010),
+                observed(-0.001, -0.010),
+                observed(0.050, 0.500),
+            ),
+            xy_sigma_m=0.003,
+            z_sigma_m=0.002,
+            yaw_sigma_rad=np.deg2rad(2.0),
+        )
+        self.assertLess(abs(float(belief.pose[0, 3]) - 0.25), 0.004)
+        self.assertLess(abs(float(np.arctan2(belief.pose[1, 0], belief.pose[0, 0]))), 0.08)
+        self.assertLess(belief.inlier_fraction, 1.0)
+        self.assertGreater(belief.maximum_normalized_residual, 2.5)
+        self.assertGreater(belief.effective_view_count, 3.0)
+
+    def test_multiview_synthesis_preserves_primary_observation_and_count(self) -> None:
+        clean = np.eye(4)
+        clean[:3, 3] = [0.25, -0.12, 0.30]
+        primary = clean.copy()
+        primary[0, 3] += 0.002
+        observations = synthesize_multiview_observations(
+            clean,
+            primary,
+            view_count=5,
+            xy_sigma_m=0.003,
+            z_sigma_m=0.002,
+            yaw_sigma_rad=np.deg2rad(2.0),
+            outlier_probability=0.2,
+            rng=np.random.default_rng(123),
+        )
+        self.assertEqual(len(observations), 5)
+        np.testing.assert_allclose(observations[0], primary)
+        self.assertTrue(all(pose.shape == (4, 4) for pose in observations))
+
+    def test_balanced_episode_subset_keeps_an_equal_task_count(self) -> None:
+        task_ids = np.repeat(np.arange(TASK_COUNT, dtype=np.int8), 3)
+        data = {
+            "task_ids": task_ids,
+            "contexts": np.arange(len(task_ids) * CONTEXT_DIM, dtype=np.float32).reshape(len(task_ids), CONTEXT_DIM),
+        }
+        subset = balanced_episode_subset(data, episodes_per_task=2)
+        self.assertEqual(len(subset["task_ids"]), TASK_COUNT * 2)
+        for task_id in range(TASK_COUNT):
+            self.assertEqual(int(np.count_nonzero(subset["task_ids"] == task_id)), 2)
 
 
 if __name__ == "__main__":

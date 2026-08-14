@@ -191,6 +191,144 @@ def rigidify_pose(pose: np.ndarray) -> np.ndarray:
     return result
 
 
+def wrap_angle(angle_rad: float) -> float:
+    """Wrap an angle to [-pi, pi) without changing its physical orientation."""
+    return float((angle_rad + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+@dataclass(frozen=True)
+class PoseBelief:
+    """A robust SE(3) pose estimate with an auditable uncertainty summary.
+
+    The current simulator perturbs target poses in XYZ plus camera-frame yaw.
+    This belief deliberately preserves the non-yaw part of the reference pose
+    instead of claiming to solve a general raw-RGB 6D pose-estimation problem.
+    """
+
+    pose: np.ndarray
+    xy_sigma_m: float
+    z_sigma_m: float
+    yaw_sigma_rad: float
+    inlier_fraction: float
+    effective_view_count: float
+    maximum_normalized_residual: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "pose", rigidify_pose(self.pose))
+        for label, value in (
+            ("xy_sigma_m", self.xy_sigma_m),
+            ("z_sigma_m", self.z_sigma_m),
+            ("yaw_sigma_rad", self.yaw_sigma_rad),
+            ("effective_view_count", self.effective_view_count),
+            ("maximum_normalized_residual", self.maximum_normalized_residual),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{label} must be positive and finite")
+        if not math.isfinite(self.inlier_fraction) or not 0.0 <= self.inlier_fraction <= 1.0:
+            raise ValueError("inlier_fraction must be in [0, 1]")
+
+
+def fuse_pose_belief(
+    observations: tuple[np.ndarray, ...] | list[np.ndarray],
+    xy_sigma_m: float,
+    z_sigma_m: float,
+    yaw_sigma_rad: float,
+    huber_delta: float = 2.5,
+) -> PoseBelief:
+    """Fuse repeated calibrated pose observations with Huber down-weighting.
+
+    The fusion is intentionally small and inspectable: translation is estimated
+    in the base frame and the only rotational perturbation handled is relative
+    yaw, matching the synthetic sensor model used throughout this benchmark.
+    """
+    if not observations:
+        raise ValueError("at least one pose observation is required")
+    values = (xy_sigma_m, z_sigma_m, yaw_sigma_rad, huber_delta)
+    if not all(math.isfinite(value) and value > 0.0 for value in values):
+        raise ValueError("fusion uncertainty scales and huber_delta must be positive and finite")
+
+    poses = tuple(rigidify_pose(pose) for pose in observations)
+    reference = poses[0]
+    translations = np.stack([pose[:3, 3] for pose in poses], axis=0)
+    reference_rotation = reference[:3, :3]
+    yaw_offsets = np.asarray(
+        [
+            math.atan2(
+                float((pose[:3, :3] @ reference_rotation.T)[1, 0]),
+                float((pose[:3, :3] @ reference_rotation.T)[0, 0]),
+            )
+            for pose in poses
+        ],
+        dtype=np.float64,
+    )
+    location = np.median(translations, axis=0)
+    yaw_location = float(math.atan2(np.sin(yaw_offsets).mean(), np.cos(yaw_offsets).mean()))
+    scales = np.array([xy_sigma_m, xy_sigma_m, z_sigma_m], dtype=np.float64)
+    weights = np.ones(len(poses), dtype=np.float64)
+    normalized = np.zeros(len(poses), dtype=np.float64)
+    for _ in range(8):
+        translation_residual = np.linalg.norm((translations - location) / scales, axis=1)
+        yaw_residual = np.asarray([wrap_angle(value - yaw_location) for value in yaw_offsets], dtype=np.float64)
+        normalized = np.sqrt(translation_residual**2 + (yaw_residual / yaw_sigma_rad) ** 2)
+        weights = np.minimum(1.0, huber_delta / np.maximum(normalized, 1e-9))
+        updated_location = np.average(translations, axis=0, weights=weights)
+        updated_yaw = float(math.atan2(np.sum(weights * np.sin(yaw_offsets)), np.sum(weights * np.cos(yaw_offsets))))
+        if np.linalg.norm(updated_location - location) < 1e-10 and abs(wrap_angle(updated_yaw - yaw_location)) < 1e-10:
+            location, yaw_location = updated_location, updated_yaw
+            break
+        location, yaw_location = updated_location, updated_yaw
+
+    effective_view_count = float(weights.sum() ** 2 / np.maximum(np.square(weights).sum(), 1e-9))
+    translation_variance = np.average((translations - location) ** 2, axis=0, weights=weights)
+    yaw_variance = float(
+        np.average(
+            np.asarray([wrap_angle(value - yaw_location) ** 2 for value in yaw_offsets], dtype=np.float64),
+            weights=weights,
+        )
+    )
+    fused_pose = reference.copy()
+    fused_pose[:3, 3] = location
+    fused_pose[:3, :3] = rotation_z(yaw_location) @ reference_rotation
+    return PoseBelief(
+        pose=fused_pose,
+        xy_sigma_m=max(0.00025, math.sqrt(max(float(translation_variance[0]), float(translation_variance[1]), 0.0) + xy_sigma_m**2) / math.sqrt(effective_view_count)),
+        z_sigma_m=max(0.00025, math.sqrt(max(float(translation_variance[2]), 0.0) + z_sigma_m**2) / math.sqrt(effective_view_count)),
+        yaw_sigma_rad=max(math.radians(0.08), math.sqrt(max(yaw_variance, 0.0) + yaw_sigma_rad**2) / math.sqrt(effective_view_count)),
+        inlier_fraction=float(np.mean(normalized <= huber_delta)),
+        effective_view_count=effective_view_count,
+        maximum_normalized_residual=max(1e-9, float(normalized.max())),
+    )
+
+
+def synthesize_multiview_observations(
+    clean_pose: np.ndarray,
+    primary_observation: np.ndarray,
+    view_count: int,
+    xy_sigma_m: float,
+    z_sigma_m: float,
+    yaw_sigma_rad: float,
+    outlier_probability: float,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, ...]:
+    """Create benchmark-only independent re-observations around a clean pose.
+
+    In a deployed system, callers would pass calibrated camera estimates to
+    ``fuse_pose_belief`` directly. This helper exists only to make the offline
+    benchmark's multi-observation assumption explicit and reproducible.
+    """
+    if view_count < 1:
+        raise ValueError("view_count must be positive")
+    if not math.isfinite(outlier_probability) or not 0.0 <= outlier_probability < 1.0:
+        raise ValueError("outlier_probability must be in [0, 1)")
+    observations = [rigidify_pose(primary_observation)]
+    for _ in range(1, view_count):
+        scale = 4.0 if rng.random() < outlier_probability else 1.0
+        observations.append(
+            perturb_pose(clean_pose, rng, xy_sigma_m * scale, z_sigma_m * scale, yaw_sigma_rad * scale)
+        )
+    return tuple(observations)
+
+
 @dataclass(frozen=True)
 class DatasetSettings:
     count: int
@@ -845,6 +983,380 @@ def project_with_constraints(
     return trajectory, None
 
 
+def trajectory_risk_features(trajectory: np.ndarray, scene: DiagnosticScene) -> dict[str, float]:
+    """Compute transparent path-quality terms for offline candidate ranking."""
+    values = np.asarray(trajectory, dtype=np.float64)
+    if values.shape != (TRAJECTORY_STEPS, JOINT_COUNT) or not np.isfinite(values).all():
+        raise ValueError(f"trajectory must have shape ({TRAJECTORY_STEPS}, {JOINT_COUNT})")
+    model = load_default_model()
+    review = review_tcp_positions(trajectory_tcp_positions(model, values), scene)
+    obstacle_margin = math.inf
+    if review.minimum_obstacle_clearance_m is not None:
+        obstacle_margin = review.minimum_obstacle_clearance_m - scene.minimum_obstacle_clearance_m
+    table_margin = review.minimum_table_clearance_m - scene.minimum_table_clearance_m
+    step_norms = np.linalg.norm(np.diff(values, axis=0), axis=1)
+    accelerations = np.linalg.norm(np.diff(values, n=2, axis=0), axis=1)
+    return {
+        "minimum_clearance_margin_m": float(min(table_margin, obstacle_margin)),
+        "joint_travel_rad": float(step_norms.sum()),
+        "maximum_joint_step_rad": float(step_norms.max(initial=0.0)),
+        "mean_joint_acceleration_rad": float(accelerations.mean()) if len(accelerations) else 0.0,
+    }
+
+
+def select_cvar_belief_candidate(
+    candidates: np.ndarray,
+    scenario_grasp_poses: tuple[np.ndarray, ...],
+    scenario_place_poses: tuple[np.ndarray, ...],
+    fused_grasp_pose: np.ndarray,
+    fused_place_pose: np.ndarray,
+    scene: DiagnosticScene,
+    task_name: str,
+    minimum_safe_fraction: float,
+) -> dict[str, Any]:
+    """Select a policy proposal by lower-tail clearance across pose scenarios.
+
+    This is a risk-sensitive *offline* selector. It ranks existing diffusion
+    action chunks by their scenario safety fraction and 25th-percentile
+    clearance, then uses joint travel and acceleration only as tie breakers.
+    It is not a replacement for a calibrated physical safety controller.
+    """
+    predictions = np.asarray(candidates, dtype=np.float64)
+    if predictions.ndim != 3 or predictions.shape[1:] != (TRAJECTORY_STEPS, JOINT_COUNT):
+        raise ValueError(f"candidates must have shape (count, {TRAJECTORY_STEPS}, {JOINT_COUNT})")
+    if not scenario_grasp_poses or len(scenario_grasp_poses) != len(scenario_place_poses):
+        raise ValueError("grasp and place scenario observations must be non-empty and paired")
+    if not 0.0 < minimum_safe_fraction <= 1.0:
+        raise ValueError("minimum_safe_fraction must be in (0, 1]")
+
+    reports: list[dict[str, Any]] = []
+    rejection_counts: Counter[str] = Counter()
+    for candidate_index, prediction in enumerate(predictions):
+        margins: list[float] = []
+        travels: list[float] = []
+        accelerations: list[float] = []
+        failures: Counter[str] = Counter()
+        for grasp_pose, place_pose in zip(scenario_grasp_poses, scenario_place_poses):
+            projected, failure = project_with_constraints(prediction, grasp_pose, place_pose, scene, task_name)
+            if projected is None:
+                failures[failure or "scenario projection failed"] += 1
+                continue
+            features = trajectory_risk_features(projected, scene)
+            margins.append(float(features["minimum_clearance_margin_m"]))
+            travels.append(float(features["joint_travel_rad"]))
+            accelerations.append(float(features["mean_joint_acceleration_rad"]))
+        safe_fraction = len(margins) / len(scenario_grasp_poses)
+        if margins:
+            # CVaR is the mean outcome in the lower tail, not merely the
+            # 25th-percentile VaR threshold. With five scenarios this averages
+            # the two least-clear projected paths.
+            tail_count = max(1, int(math.ceil(len(margins) * 0.25)))
+            clearance_cvar = float(np.mean(np.partition(np.asarray(margins), tail_count - 1)[:tail_count]))
+        else:
+            clearance_cvar = -math.inf
+        mean_travel = float(np.mean(travels)) if travels else math.inf
+        mean_acceleration = float(np.mean(accelerations)) if accelerations else math.inf
+        # Safe-scenario coverage is the primary term. Lower-tail clearance
+        # avoids selecting a path that is only safe under its average view.
+        risk_score = (
+            100.0 * safe_fraction
+            + 1000.0 * clearance_cvar
+            - 0.25 * mean_travel
+            - 0.50 * mean_acceleration
+        )
+        reports.append(
+            {
+                "candidate_index": candidate_index,
+                "safe_fraction": safe_fraction,
+                "clearance_cvar_m": clearance_cvar,
+                "mean_joint_travel_rad": mean_travel,
+                "mean_joint_acceleration_rad": mean_acceleration,
+                "risk_score": risk_score,
+                "rejection_reasons": dict(sorted(failures.items())),
+            }
+        )
+        rejection_counts.update(failures)
+
+    feasible = [report for report in reports if report["safe_fraction"] >= minimum_safe_fraction]
+    if not feasible:
+        return {
+            "accepted": False,
+            "reason": "no diffusion candidate met the belief-scenario safety threshold",
+            "candidate_reports": reports,
+            "rejection_reasons": dict(sorted(rejection_counts.items())),
+        }
+    selected = max(feasible, key=lambda report: float(report["risk_score"]))
+    selected_prediction = predictions[int(selected["candidate_index"])]
+    final_trajectory, failure = project_with_constraints(
+        selected_prediction,
+        fused_grasp_pose,
+        fused_place_pose,
+        scene,
+        task_name,
+    )
+    if final_trajectory is None:
+        rejection_counts[failure or "fused-pose projection failed"] += 1
+        return {
+            "accepted": False,
+            "reason": failure or "fused-pose projection failed",
+            "candidate_reports": reports,
+            "rejection_reasons": dict(sorted(rejection_counts.items())),
+        }
+    return {
+        "accepted": True,
+        "trajectory": final_trajectory,
+        "selected_candidate_index": int(selected["candidate_index"]),
+        "safe_fraction": float(selected["safe_fraction"]),
+        "clearance_cvar_m": float(selected["clearance_cvar_m"]),
+        "risk_score": float(selected["risk_score"]),
+        "final_features": trajectory_risk_features(final_trajectory, scene),
+        "candidate_reports": reports,
+        "rejection_reasons": dict(sorted(rejection_counts.items())),
+    }
+
+
+def balanced_episode_subset(data, episodes_per_task: int):
+    """Return a deterministic balanced in-memory subset for development runs."""
+    if episodes_per_task <= 0:
+        return data
+    if "task_ids" not in data:
+        raise ValueError("balanced evaluation requires task_ids in the dataset")
+    task_ids = np.asarray(data["task_ids"])
+    selected = []
+    for task_id, task_name in enumerate(TASK_NAMES):
+        matches = np.flatnonzero(task_ids == task_id)
+        if len(matches) < episodes_per_task:
+            raise ValueError(f"dataset has only {len(matches)} {task_name!r} episodes; need {episodes_per_task}")
+        selected.extend(matches[:episodes_per_task])
+    indices = np.asarray(sorted(selected), dtype=np.int64)
+    keys = data.files if hasattr(data, "files") else data.keys()
+    return {key: np.asarray(data[key])[indices] for key in keys}
+
+
+def evaluate_belief_space_planning(
+    model,
+    checkpoint: dict[str, Any],
+    data,
+    scene: DiagnosticScene,
+    arm,
+    device,
+    seed: int,
+    view_count: int,
+    candidate_count: int,
+    outlier_probability: float,
+    minimum_safe_fraction: float,
+) -> dict[str, Any]:
+    """Benchmark robust pose fusion and CVaR planning on synthetic re-observations.
+
+    This evaluation deliberately keeps the primary benchmark untouched. It is
+    an ablation-style side path whose clean poses are used only to synthesize
+    repeatable observations and compute metrics, never as planner inputs.
+    """
+    if view_count < 2:
+        raise ValueError("belief-space evaluation requires at least two observations")
+    if candidate_count < 1:
+        raise ValueError("candidate_count must be positive")
+    torch, _, _, _ = require_torch()
+    contexts = data["contexts"]
+    task_ids = data["task_ids"] if "task_ids" in data else np.zeros(len(contexts), dtype=np.int8)
+    clean_grasp = data["clean_grasp_poses"]
+    clean_place = data["clean_place_poses"]
+    observed_grasp = data["observed_grasp_poses"]
+    observed_place = data["observed_place_poses"]
+    context_mean = np.asarray(checkpoint["context_mean"], dtype=np.float64)
+    context_std = np.asarray(checkpoint["context_std"], dtype=np.float64)
+    support_threshold = float(checkpoint["context_support_threshold"])
+
+    primary_pose_errors: list[float] = []
+    fused_pose_errors: list[float] = []
+    selected_errors: list[float] = []
+    inlier_fractions: list[float] = []
+    effective_view_counts: list[float] = []
+    selected_safe_fractions: list[float] = []
+    selected_clearance_cvars: list[float] = []
+    selected_joint_travels: list[float] = []
+    selected_accelerations: list[float] = []
+    support_abstentions = 0
+    accepted = 0
+    rejection_reasons: Counter[str] = Counter()
+    task_records: dict[str, dict[str, Any]] = {
+        task_name: {
+            "episodes": 0,
+            "primary_errors": [],
+            "fused_errors": [],
+            "selected_errors": [],
+            "inliers": [],
+            "effective_views": [],
+            "safe_fractions": [],
+            "clearance_cvars": [],
+            "accepted": 0,
+            "support_abstentions": 0,
+        }
+        for task_name in TASK_NAMES
+    }
+    for index, source_context in enumerate(contexts):
+        task_name = task_name_from_id(int(task_ids[index]))
+        record = task_records[task_name]
+        record["episodes"] += 1
+        rng = np.random.default_rng(seed * 1_000_003 + index)
+        xy_sigma_m, z_sigma_m, yaw_sigma_rad = counterfactual_sensor_scales(source_context, 1.0)
+        grasp_views = synthesize_multiview_observations(
+            clean_grasp[index],
+            observed_grasp[index],
+            view_count,
+            xy_sigma_m,
+            z_sigma_m,
+            yaw_sigma_rad,
+            outlier_probability,
+            rng,
+        )
+        place_views = synthesize_multiview_observations(
+            clean_place[index],
+            observed_place[index],
+            view_count,
+            xy_sigma_m,
+            z_sigma_m,
+            yaw_sigma_rad,
+            outlier_probability,
+            rng,
+        )
+        grasp_belief = fuse_pose_belief(grasp_views, xy_sigma_m, z_sigma_m, yaw_sigma_rad)
+        place_belief = fuse_pose_belief(place_views, xy_sigma_m, z_sigma_m, yaw_sigma_rad)
+        primary_error = float(
+            0.5
+            * (
+                np.linalg.norm(rigidify_pose(observed_grasp[index])[:3, 3] - rigidify_pose(clean_grasp[index])[:3, 3])
+                + np.linalg.norm(rigidify_pose(observed_place[index])[:3, 3] - rigidify_pose(clean_place[index])[:3, 3])
+            )
+        )
+        fused_error = float(
+            0.5
+            * (
+                np.linalg.norm(grasp_belief.pose[:3, 3] - rigidify_pose(clean_grasp[index])[:3, 3])
+                + np.linalg.norm(place_belief.pose[:3, 3] - rigidify_pose(clean_place[index])[:3, 3])
+            )
+        )
+        primary_pose_errors.append(primary_error)
+        fused_pose_errors.append(fused_error)
+        record["primary_errors"].append(primary_error)
+        record["fused_errors"].append(fused_error)
+        inlier_fraction = min(grasp_belief.inlier_fraction, place_belief.inlier_fraction)
+        effective_views = min(grasp_belief.effective_view_count, place_belief.effective_view_count)
+        inlier_fractions.append(inlier_fraction)
+        effective_view_counts.append(effective_views)
+        record["inliers"].append(inlier_fraction)
+        record["effective_views"].append(effective_views)
+
+        # The policy can use the reduced belief uncertainty, while the support
+        # gate deliberately retains the raw declared sensor scale. Multi-view
+        # fusion must not turn an OOD camera condition into an in-distribution
+        # one merely by averaging several observations.
+        raw_confidence = float(source_context[18])
+        fused_confidence = min(0.995, max(0.05, raw_confidence * inlier_fraction))
+        fused_xy_sigma_m = max(grasp_belief.xy_sigma_m, place_belief.xy_sigma_m)
+        fused_yaw_sigma_rad = max(grasp_belief.yaw_sigma_rad, place_belief.yaw_sigma_rad)
+        policy_context = pose_to_context(
+            grasp_belief.pose,
+            place_belief.pose,
+            fused_confidence,
+            fused_xy_sigma_m,
+            fused_yaw_sigma_rad,
+            task_name,
+        )
+        support_context = pose_to_context(
+            grasp_belief.pose,
+            place_belief.pose,
+            raw_confidence,
+            xy_sigma_m,
+            yaw_sigma_rad,
+            task_name,
+        )
+        support_distance = float(np.linalg.norm((support_context.astype(np.float64) - context_mean) / context_std))
+        if support_distance > support_threshold:
+            support_abstentions += 1
+            record["support_abstentions"] += 1
+            rejection_reasons["belief observation outside calibrated training support"] += 1
+            continue
+        context = torch.tensor(policy_context, dtype=torch.float32)
+        candidates = sample_trajectories(
+            model,
+            context,
+            int(checkpoint["diffusion_steps"]),
+            candidate_count,
+            device,
+        ) * ASSUMED_JOINT_LIMIT_RAD
+        candidates = np.clip(candidates, -ASSUMED_JOINT_LIMIT_RAD, ASSUMED_JOINT_LIMIT_RAD)
+        selection = select_cvar_belief_candidate(
+            candidates,
+            grasp_views,
+            place_views,
+            grasp_belief.pose,
+            place_belief.pose,
+            scene,
+            task_name,
+            minimum_safe_fraction,
+        )
+        rejection_reasons.update(selection["rejection_reasons"])
+        if not selection["accepted"]:
+            rejection_reasons[str(selection["reason"])] += 1
+            continue
+        trajectory = selection["trajectory"]
+        endpoint_error = pose_position_error(arm, trajectory[GRASP_INDEX], clean_grasp[index])
+        selected_errors.append(endpoint_error)
+        record["selected_errors"].append(endpoint_error)
+        selected_safe_fractions.append(float(selection["safe_fraction"]))
+        selected_clearance_cvars.append(float(selection["clearance_cvar_m"]))
+        record["safe_fractions"].append(float(selection["safe_fraction"]))
+        record["clearance_cvars"].append(float(selection["clearance_cvar_m"]))
+        features = selection["final_features"]
+        selected_joint_travels.append(float(features["joint_travel_rad"]))
+        selected_accelerations.append(float(features["mean_joint_acceleration_rad"]))
+        accepted += 1
+        record["accepted"] += 1
+
+    task_metrics = {}
+    for task_name, record in task_records.items():
+        episodes = int(record["episodes"])
+        task_metrics[task_name] = {
+            "episodes": episodes,
+            "primary_mean_pose_error_m": float(np.mean(record["primary_errors"])),
+            "fused_mean_pose_error_m": float(np.mean(record["fused_errors"])),
+            "selected_safe_rate": record["accepted"] / episodes,
+            "support_abstention_rate": record["support_abstentions"] / episodes,
+            "mean_inlier_fraction": float(np.mean(record["inliers"])),
+            "mean_effective_view_count": float(np.mean(record["effective_views"])),
+            "mean_scenario_safe_fraction": float(np.mean(record["safe_fractions"])) if record["safe_fractions"] else None,
+            "mean_clearance_cvar_m": float(np.mean(record["clearance_cvars"])) if record["clearance_cvars"] else None,
+            "selected_mean_grasp_position_error_m": float(np.mean(record["selected_errors"])) if record["selected_errors"] else None,
+        }
+    primary_mean = float(np.mean(primary_pose_errors))
+    fused_mean = float(np.mean(fused_pose_errors))
+    return {
+        "enabled": True,
+        "benchmark_only_synthetic_multiview_observations": True,
+        "view_count": view_count,
+        "candidate_count": candidate_count,
+        "synthetic_outlier_probability": outlier_probability,
+        "minimum_scenario_safe_fraction": minimum_safe_fraction,
+        "task_metrics": task_metrics,
+        "metrics": {
+            "primary_mean_pose_error_m": primary_mean,
+            "fused_mean_pose_error_m": fused_mean,
+            "pose_error_reduction_fraction": (primary_mean - fused_mean) / primary_mean if primary_mean else 0.0,
+            "mean_inlier_fraction": float(np.mean(inlier_fractions)),
+            "mean_effective_view_count": float(np.mean(effective_view_counts)),
+            "selected_safe_rate": accepted / len(contexts),
+            "support_abstention_rate": support_abstentions / len(contexts),
+            "mean_selected_scenario_safe_fraction": float(np.mean(selected_safe_fractions)) if selected_safe_fractions else None,
+            "mean_selected_clearance_cvar_m": float(np.mean(selected_clearance_cvars)) if selected_clearance_cvars else None,
+            "selected_mean_grasp_position_error_m": float(np.mean(selected_errors)) if selected_errors else None,
+            "mean_selected_joint_travel_rad": float(np.mean(selected_joint_travels)) if selected_joint_travels else None,
+            "mean_selected_joint_acceleration_rad": float(np.mean(selected_accelerations)) if selected_accelerations else None,
+        },
+        "rejection_reason_counts": dict(sorted(rejection_reasons.items())),
+    }
+
+
 def pose_position_error(model, joint_angles: np.ndarray, target_pose: np.ndarray) -> float:
     actual = fk_space(model.home_grasp_tcp, model.screw_axes, joint_angles)
     return float(np.linalg.norm(actual[:3, 3] - target_pose[:3, 3]))
@@ -860,6 +1372,11 @@ def evaluate_model(
     counterfactual_rollouts: int = 0,
     minimum_counterfactual_safe_fraction: float = 0.75,
     counterfactual_noise_fraction: float = 0.50,
+    belief_views: int = 0,
+    belief_candidate_count: int = 3,
+    belief_outlier_probability: float = 0.15,
+    belief_minimum_safe_fraction: float = 0.75,
+    episodes_per_task: int = 0,
 ) -> dict[str, Any]:
     torch, _, _, _ = require_torch()
     if samples_per_context < 1 or not math.isfinite(abstain_dispersion_rad) or abstain_dispersion_rad <= 0.0:
@@ -870,6 +1387,16 @@ def evaluate_model(
         raise ValueError("minimum_counterfactual_safe_fraction must be in (0, 1]")
     if not 0.0 < counterfactual_noise_fraction <= 1.0:
         raise ValueError("counterfactual_noise_fraction must be in (0, 1]")
+    if belief_views not in (0, 1) and belief_views < 2:
+        raise ValueError("belief_views must be zero, one, or at least two")
+    if belief_views and belief_candidate_count < 1:
+        raise ValueError("belief_candidate_count must be positive when belief planning is enabled")
+    if not math.isfinite(belief_outlier_probability) or not 0.0 <= belief_outlier_probability < 1.0:
+        raise ValueError("belief_outlier_probability must be in [0, 1)")
+    if not 0.0 < belief_minimum_safe_fraction <= 1.0:
+        raise ValueError("belief_minimum_safe_fraction must be in (0, 1]")
+    if episodes_per_task < 0:
+        raise ValueError("episodes_per_task must be non-negative")
     torch.manual_seed(seed)
     np.random.seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -887,9 +1414,9 @@ def evaluate_model(
         raise ValueError("checkpoint process-phase graph does not match the active multi-task benchmark")
     model = build_denoiser(int(checkpoint["hidden_dim"]), int(checkpoint["diffusion_steps"])).to(device)
     model.load_state_dict(checkpoint["state_dict"])
-    data = np.load(dataset_path)
+    data = balanced_episode_subset(np.load(dataset_path), episodes_per_task)
     contexts = data["contexts"]
-    task_ids = data["task_ids"] if "task_ids" in data.files else np.zeros(len(contexts), dtype=np.int8)
+    task_ids = data["task_ids"] if "task_ids" in data else np.zeros(len(contexts), dtype=np.int8)
     if len(task_ids) != len(contexts):
         raise ValueError("dataset task_ids length does not match contexts")
     clean_grasp = data["clean_grasp_poses"]
@@ -1048,6 +1575,21 @@ def evaluate_model(
                     "counterfactual_mean_projected_grasp_error_m": float(np.mean(record["counterfactual_errors"])) if record["counterfactual_errors"] else None,
                 }
             )
+    belief_space_planning = None
+    if belief_views >= 2:
+        belief_space_planning = evaluate_belief_space_planning(
+            model,
+            checkpoint,
+            data,
+            scene,
+            arm,
+            device,
+            seed,
+            belief_views,
+            belief_candidate_count,
+            belief_outlier_probability,
+            belief_minimum_safe_fraction,
+        )
     report = {
         "evaluation": "constraint_diffusion_digital_twin",
         "architecture": ARCHITECTURE_NAME,
@@ -1058,6 +1600,7 @@ def evaluate_model(
         "model_parameters": int(checkpoint.get("model_parameters", 0)),
         "real_motion_enabled": False,
         "episodes": int(len(contexts)),
+        "episodes_per_task": episodes_per_task or None,
         "seed": seed,
         "samples_per_context": samples_per_context,
         "abstain_dispersion_rad": abstain_dispersion_rad,
@@ -1072,6 +1615,7 @@ def evaluate_model(
             "mean_projected_grasp_error_m": float(np.mean(counterfactual_errors)) if counterfactual_errors else None,
             "rejection_reason_counts": dict(sorted(counterfactual_reason_counts.items())),
         },
+        "belief_space_planning": belief_space_planning,
         "metrics": {
             "raw_mean_grasp_position_error_m": float(np.mean(raw_errors)),
             "raw_scene_safe_rate": raw_scene_safe / len(contexts),
@@ -1141,6 +1685,11 @@ def main() -> int:
     evaluate.add_argument("--counterfactual-rollouts", type=int, default=0, help="additional perception rollouts used for robust plan consensus")
     evaluate.add_argument("--minimum-counterfactual-safe-fraction", type=float, default=0.75)
     evaluate.add_argument("--counterfactual-noise-fraction", type=float, default=0.50)
+    evaluate.add_argument("--belief-views", type=int, default=0, help="enable benchmark-only robust fusion with this many pose observations")
+    evaluate.add_argument("--belief-candidate-count", type=int, default=3, help="diffusion candidates ranked by scenario-CVaR clearance")
+    evaluate.add_argument("--belief-outlier-probability", type=float, default=0.15, help="synthetic re-observation outlier rate used only by the offline benchmark")
+    evaluate.add_argument("--belief-minimum-safe-fraction", type=float, default=0.75)
+    evaluate.add_argument("--episodes-per-task", type=int, default=0, help="deterministic balanced development subset; zero uses the full dataset")
 
     args = parser.parse_args()
     if args.command == "generate":
@@ -1162,6 +1711,11 @@ def main() -> int:
             args.counterfactual_rollouts,
             args.minimum_counterfactual_safe_fraction,
             args.counterfactual_noise_fraction,
+            args.belief_views,
+            args.belief_candidate_count,
+            args.belief_outlier_probability,
+            args.belief_minimum_safe_fraction,
+            args.episodes_per_task,
         )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

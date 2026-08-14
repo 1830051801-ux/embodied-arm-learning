@@ -83,8 +83,8 @@ def main() -> int:
     shift_metrics = shifted["task_metrics"]
 
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 9, "axes.titleweight": "bold"})
-    fig = plt.figure(figsize=(17, 10), facecolor="#f7f8fa")
-    grid = fig.add_gridspec(2, 3, width_ratios=(1.45, 1.0, 1.0), hspace=0.42, wspace=0.34)
+    fig = plt.figure(figsize=(17, 13), facecolor="#f7f8fa")
+    grid = fig.add_gridspec(3, 3, width_ratios=(1.45, 1.0, 1.0), hspace=0.44, wspace=0.34)
 
     ax3d = fig.add_subplot(grid[:, 0], projection="3d")
     x_mesh, y_mesh = np.meshgrid(np.linspace(0.10, 0.42, 2), np.linspace(-0.28, 0.22, 2))
@@ -162,17 +162,75 @@ def main() -> int:
     for bar, value in zip(bars, ood_rates):
         ax_ood.text(bar.get_x() + bar.get_width() / 2, value + 2.0, f"{value:.1f}%", ha="center", va="bottom", fontsize=8)
 
-    fig.suptitle("XiaoU Process-Graph Multi-Task Digital Twin Benchmark", fontsize=16, fontweight="bold", x=0.51, y=0.98)
+    belief = nominal.get("belief_space_planning")
+    ax_fusion = fig.add_subplot(grid[2, 1])
+    ax_risk = fig.add_subplot(grid[2, 2])
+    if isinstance(belief, dict) and belief.get("enabled"):
+        belief_metrics = belief["metrics"]
+        pose_errors = [
+            float(belief_metrics["primary_mean_pose_error_m"]) * 1000.0,
+            float(belief_metrics["fused_mean_pose_error_m"]) * 1000.0,
+        ]
+        fusion_bars = ax_fusion.bar(
+            ["primary\nobservation", "robust\nbelief"],
+            pose_errors,
+            color=["#b34a4a", "#2b7a3d"],
+            width=0.58,
+        )
+        reduction = float(belief_metrics["pose_error_reduction_fraction"]) * 100.0
+        ax_fusion.set_title("Robust Multi-Observation Pose Belief")
+        ax_fusion.set_ylabel("Mean pose error (mm)")
+        ax_fusion.set_ylim(0, max(pose_errors) * 1.28)
+        ax_fusion.grid(axis="y", alpha=0.25)
+        for bar, value in zip(fusion_bars, pose_errors):
+            ax_fusion.text(bar.get_x() + bar.get_width() / 2, value + max(pose_errors) * 0.04, f"{value:.2f}", ha="center", va="bottom", fontsize=8)
+        ax_fusion.text(0.5, 0.93, f"error reduction {reduction:.1f}%", transform=ax_fusion.transAxes, ha="center", va="top", color="#2b7a3d", fontsize=9, fontweight="bold")
+
+        selection_values = [
+            float(belief_metrics["selected_safe_rate"]) * 100.0,
+            float(belief_metrics["mean_selected_scenario_safe_fraction"] or 0.0) * 100.0,
+            float(belief_metrics["mean_inlier_fraction"]) * 100.0,
+        ]
+        selection_bars = ax_risk.bar(
+            ["accepted\nplans", "selected\nscenarios", "view\ninliers"],
+            selection_values,
+            color=["#345d8c", "#7957a6", "#d58a22"],
+            width=0.60,
+        )
+        ax_risk.set_title("Scenario-CVaR Candidate Selection")
+        ax_risk.set_ylabel("Rate (%)")
+        ax_risk.set_ylim(0, 120)
+        ax_risk.grid(axis="y", alpha=0.25)
+        for bar, value in zip(selection_bars, selection_values):
+            ax_risk.text(bar.get_x() + bar.get_width() / 2, value + 2.0, f"{value:.1f}%", ha="center", va="bottom", fontsize=8)
+        clearance = float(belief_metrics["mean_selected_clearance_cvar_m"] or 0.0) * 1000.0
+        ax_risk.text(0.5, 0.93, f"lower-tail CVaR clearance: {clearance:.1f} mm", transform=ax_risk.transAxes, ha="center", va="top", color="#34495e", fontsize=8)
+    else:
+        for axis, title in ((ax_fusion, "Robust Multi-Observation Pose Belief"), (ax_risk, "Scenario-CVaR Candidate Selection")):
+            axis.set_title(title)
+            axis.text(0.5, 0.5, "Not enabled in this report", ha="center", va="center", color="#5e6670")
+            axis.set_xticks([])
+            axis.set_yticks([])
+
+    episodes_per_task = nominal.get("episodes_per_task")
+    evaluation_label = (
+        f"Balanced offline stress run: {nominal['episodes']} episodes / {episodes_per_task} per task"
+        if episodes_per_task
+        else f"Offline evaluation: {nominal['episodes']} episodes"
+    )
+    fig.subplots_adjust(top=0.90, bottom=0.07)
+    fig.suptitle("XiaoU Process-Graph Multi-Task Digital Twin Benchmark", fontsize=16, fontweight="bold", x=0.51, y=0.965)
+    fig.text(0.51, 0.943, evaluation_label, ha="center", color="#5e6670", fontsize=9)
     fig.text(
         0.51,
-        0.018,
-        "POE kinematics | URDF/ROS 2 review | process-graph Action-Chunk Transformer | counterfactual safety consensus | IK/TCP projection | offline only",
+        0.025,
+        "POE kinematics | URDF/ROS 2 review | process-graph Action-Chunk Transformer | robust pose belief | scenario-CVaR selection | offline only",
         ha="center",
         color="#5e6670",
         fontsize=9,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(args.output, dpi=180, bbox_inches="tight", facecolor=fig.get_facecolor())
+    fig.savefig(args.output, dpi=180, facecolor=fig.get_facecolor())
     plt.close(fig)
     print(args.output)
     return 0

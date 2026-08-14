@@ -16,12 +16,15 @@ from constraint_diffusion_twin import (
     CONTEXT_DIM,
     CONTEXT_TOKEN_NAMES,
     GRASP_INDEX,
+    PHASE_NAMES,
     PLACE_INDEX,
     TASK_COUNT,
     TASK_NAMES,
+    TASK_PHASE_IDS,
     TRAJECTORY_STEPS,
     build_expert_trajectory,
     build_task_trajectory,
+    counterfactual_sensor_scales,
     pose_to_context,
     rigidify_pose,
 )
@@ -29,13 +32,17 @@ from constraint_diffusion_twin import (
 
 class ConstraintDiffusionTwinTests(unittest.TestCase):
     def test_action_chunk_transformer_contract_is_explicit(self) -> None:
-        self.assertEqual(ARCHITECTURE_NAME, "multitask_embodied_action_chunk_transformer_diffusion")
+        self.assertEqual(ARCHITECTURE_NAME, "process_graph_multitask_action_chunk_transformer_diffusion")
         self.assertEqual(
             CONTEXT_TOKEN_NAMES,
             ("visual_grasp_pose", "visual_place_goal", "observation_uncertainty", "task_profile", "learned_task_token"),
         )
         self.assertEqual(TASK_COUNT, 5)
         self.assertEqual(CONTEXT_DIM, 21 + TASK_COUNT)
+        self.assertEqual(PHASE_NAMES, ("home", "approach", "contact", "transfer", "retreat", "dwell"))
+        self.assertEqual(TASK_PHASE_IDS.shape, (TASK_COUNT, TRAJECTORY_STEPS))
+        precision_phases = TASK_PHASE_IDS[TASK_NAMES.index("precision_insert")]
+        self.assertEqual(int(precision_phases[24]), PHASE_NAMES.index("dwell"))
 
     def test_quintic_trajectory_preserves_keyframe_anchors(self) -> None:
         home = np.zeros(6)
@@ -80,6 +87,15 @@ class ConstraintDiffusionTwinTests(unittest.TestCase):
         np.testing.assert_allclose(trajectory[GRASP_INDEX], grasp)
         np.testing.assert_allclose(trajectory[PLACE_INDEX], place)
         np.testing.assert_allclose(trajectory[-1], home)
+
+    def test_counterfactual_scales_are_conservative_and_finite(self) -> None:
+        grasp = np.eye(4)
+        place = np.eye(4)
+        context = pose_to_context(grasp, place, 0.92, 0.003, np.deg2rad(2.0), "transfer")
+        xy_sigma_m, z_sigma_m, yaw_sigma_rad = counterfactual_sensor_scales(context, 0.5)
+        self.assertAlmostEqual(xy_sigma_m, 0.0015, places=7)
+        self.assertGreaterEqual(z_sigma_m, 0.0005)
+        self.assertGreater(yaw_sigma_rad, 0.0)
 
 
 if __name__ == "__main__":

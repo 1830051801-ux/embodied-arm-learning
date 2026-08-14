@@ -129,20 +129,24 @@ def main() -> int:
 
     ax_safe = fig.add_subplot(grid[0, 2])
     projected_safe = [float(task_metrics[name]["projected_safe_rate"]) * 100.0 for name in TASK_NAMES]
-    bars = ax_safe.bar(labels, projected_safe, color=[TASK_COLORS[name] for name in TASK_NAMES], width=0.62)
-    ax_safe.set_title("Task-Level Projected-Safe Coverage")
+    consensus_safe = [float(task_metrics[name].get("counterfactual_consensus_rate", 0.0)) * 100.0 for name in TASK_NAMES]
+    width = 0.36
+    bars = ax_safe.bar(positions - width / 2, projected_safe, width, color=[TASK_COLORS[name] for name in TASK_NAMES], label="single-view projection")
+    consensus_bars = ax_safe.bar(positions + width / 2, consensus_safe, width, color="#34495e", label="4-rollout consensus")
+    ax_safe.set_title("Projection vs Counterfactual Consensus")
     ax_safe.set_ylabel("Rate (%)")
     ax_safe.set_ylim(0, 108)
-    ax_safe.tick_params(axis="x", rotation=20)
+    ax_safe.set_xticks(positions, labels, rotation=20)
     ax_safe.grid(axis="y", alpha=0.25)
-    for bar, value in zip(bars, projected_safe):
+    ax_safe.legend(fontsize=7, loc="lower left")
+    for bar, value in zip(consensus_bars, consensus_safe):
         ax_safe.text(bar.get_x() + bar.get_width() / 2, value + 2.0, f"{value:.1f}%", ha="center", va="bottom", fontsize=8)
 
     ax_loss = fig.add_subplot(grid[1, 1])
     losses = checkpoint["losses"]
     ax_loss.plot(np.arange(1, len(losses) + 1), losses, color="#1677a8", linewidth=1.8)
     ax_loss.fill_between(np.arange(1, len(losses) + 1), losses, color="#1677a8", alpha=0.14)
-    ax_loss.set_title("Multi-Task Training Loss")
+    ax_loss.set_title("Process-Graph Training Loss")
     ax_loss.set_xlabel("Epoch")
     ax_loss.set_ylabel("Combined loss")
     ax_loss.grid(alpha=0.25)
@@ -158,11 +162,11 @@ def main() -> int:
     for bar, value in zip(bars, ood_rates):
         ax_ood.text(bar.get_x() + bar.get_width() / 2, value + 2.0, f"{value:.1f}%", ha="center", va="bottom", fontsize=8)
 
-    fig.suptitle("XiaoU Multi-Task Factory-Cell Digital Twin Benchmark", fontsize=16, fontweight="bold", x=0.51, y=0.98)
+    fig.suptitle("XiaoU Process-Graph Multi-Task Digital Twin Benchmark", fontsize=16, fontweight="bold", x=0.51, y=0.98)
     fig.text(
         0.51,
         0.018,
-        "POE kinematics | URDF/ROS 2 review | task-conditioned Action-Chunk Transformer | diffusion refinement | IK and TCP safety projection | offline only",
+        "POE kinematics | URDF/ROS 2 review | process-graph Action-Chunk Transformer | counterfactual safety consensus | IK/TCP projection | offline only",
         ha="center",
         color="#5e6670",
         fontsize=9,

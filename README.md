@@ -1,20 +1,21 @@
-# XiaoU Multi-Task Factory-Cell Digital Twin
+# XiaoU Process-Graph Multi-Task Digital Twin
 
-An offline six-axis manipulation benchmark that connects visual target handoff, task-conditioned action-chunk generation, kinematic projection, ROS 2 planning artifacts, and explicit hardware execution gates for the XiaoU desktop arm.
+An offline six-axis manipulation benchmark that connects visual target handoff, process-graph-conditioned action-chunk generation, counterfactual safety consensus, kinematic projection, ROS 2 planning artifacts, and explicit hardware execution gates for the XiaoU desktop arm.
 
 ![Multi-task factory-cell benchmark](assets/multitask_factory_cell_dashboard.png)
 
 ## Verified Capabilities
 
 - **Five task profiles**: transfer, two simulated placement zones, two-view inspection, and precision insertion with final dwell.
-- **Embodied Action-Chunk Transformer**: visual grasp pose, place goal, uncertainty metadata, a five-way task profile, and a learned task token are fused by a two-layer Transformer encoder. A three-layer cross-attention decoder produces a complete `32 x 6` joint action chunk.
+- **Process-Graph Action-Chunk Transformer**: visual grasp pose, place goal, uncertainty metadata, a five-way task profile, and a learned task token are fused by a two-layer Transformer encoder. Each action step also receives an explicit process phase embedding: home, approach, contact, transfer, retreat, or dwell.
 - **Proposal-guided diffusion**: a learned action-chunk proposal is refined over 16 denoising steps rather than sampling an unstructured joint trajectory from noise.
 - **Kinematics-grounded process stages**: each trajectory contains approach, contact, transfer, retreat, and task-specific dwell phases. Approach poses are created by Cartesian vertical offsets and solved with multi-start damped least-squares IK.
 - **Safety projection and abstention**: joint envelopes, visual-support distance, sample dispersion, task-region checks, IK recovery, and TCP clearance against table/fixture keep-out boxes gate every offline preview.
+- **Counterfactual safety consensus**: four re-observations consistent with declared sensor noise are independently sent through policy inference and the kinematic shield. A preview is accepted only when at least 75% of the rollouts are projected safe.
 
 ## Reproducible Multi-Task Benchmark
 
-The checked-in dashboard was generated on the local CUDA environment with a 1,320,710-parameter `hidden_dim=128` policy.
+The checked-in dashboard was generated on the local CUDA environment with a 1,321,478-parameter `hidden_dim=128` process-graph policy.
 
 | Split | Episodes | Task balance | Visual condition |
 | --- | ---: | --- | --- |
@@ -24,9 +25,10 @@ The checked-in dashboard was generated on the local CUDA environment with a 1,32
 
 | Nominal metric | Result |
 | --- | ---: |
-| Raw-policy mean grasp endpoint error | 6.62 mm |
+| Raw-policy mean grasp endpoint error | 6.35 mm |
 | Constraint-projected mean grasp endpoint error | 4.18 mm |
 | Projected-safe coverage across all tasks | 82.34% |
+| Four-rollout counterfactual consensus rate | 78.75% |
 | High-noise OOD abstention across all tasks | 100.00% |
 
 The projected-safe rate is deliberately not presented as a real-arm success rate. It is the fraction of offline episodes that pass the checked-in task, IK, and TCP scene gates after a synthetic visual observation.
@@ -43,9 +45,11 @@ flowchart LR
     C --> E["2-layer context Transformer"]
     E --> A["3-layer cross-attention action decoder"]
     Q["32 action queries"] --> A
+    G["Process-graph phase embeddings"] --> A
     A --> D["16-step diffusion refinement"]
     D --> P["Multi-start IK and task process stages"]
-    P --> S["Joint, TCP and support-domain safety gates"]
+    P --> R["4 counterfactual perception rollouts"]
+    R --> S["Joint, TCP, support-domain and consensus safety gates"]
 ```
 
 ## Quick Start

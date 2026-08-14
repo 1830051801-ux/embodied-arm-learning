@@ -10,6 +10,7 @@ command is opened by this tool.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 import json
 import math
@@ -43,8 +44,11 @@ TASK_NAMES = (
 )
 TASK_TO_ID = {name: index for index, name in enumerate(TASK_NAMES)}
 TASK_COUNT = len(TASK_NAMES)
+PHASE_NAMES = ("home", "approach", "contact", "transfer", "retreat", "dwell")
+PHASE_TO_ID = {name: index for index, name in enumerate(PHASE_NAMES)}
+PHASE_COUNT = len(PHASE_NAMES)
 CONTEXT_DIM = 21 + TASK_COUNT
-ARCHITECTURE_NAME = "multitask_embodied_action_chunk_transformer_diffusion"
+ARCHITECTURE_NAME = "process_graph_multitask_action_chunk_transformer_diffusion"
 CONTEXT_TOKEN_NAMES = (
     "visual_grasp_pose",
     "visual_place_goal",
@@ -323,6 +327,24 @@ def build_task_trajectory(
     return build_piecewise_trajectory(anchors)
 
 
+def build_task_phase_ids(task_name: str) -> np.ndarray:
+    """Encode the task process graph over the fixed 32-step action chunk."""
+    task_id_from_name(task_name)
+    phases = np.full(TRAJECTORY_STEPS, PHASE_TO_ID["transfer"], dtype=np.int64)
+    phases[0] = PHASE_TO_ID["home"]
+    phases[1:GRASP_INDEX] = PHASE_TO_ID["approach"]
+    phases[GRASP_INDEX] = PHASE_TO_ID["contact"]
+    phases[PLACE_INDEX] = PHASE_TO_ID["contact"]
+    phases[PLACE_INDEX + 1 : TRAJECTORY_STEPS - 1] = PHASE_TO_ID["retreat"]
+    phases[-1] = PHASE_TO_ID["home"]
+    if task_name == "precision_insert":
+        phases[PLACE_INDEX + 1 : 27] = PHASE_TO_ID["dwell"]
+    return phases
+
+
+TASK_PHASE_IDS = np.stack([build_task_phase_ids(task_name) for task_name in TASK_NAMES], axis=0)
+
+
 def balanced_task_schedule(count: int, tasks: tuple[str, ...], rng: np.random.Generator) -> list[str]:
     schedule = [tasks[index % len(tasks)] for index in range(count)]
     rng.shuffle(schedule)
@@ -453,13 +475,13 @@ def build_denoiser(hidden_dim: int, diffusion_steps: int):
         raise ValueError("hidden_dim must be at least 16 and divisible by four")
 
     class EmbodiedActionChunkTransformer(nn.Module):
-        """ACT-style chunk decoder conditioned on visual, uncertainty, and task tokens.
+        """Process-graph ACT-style decoder conditioned on visual and task tokens.
 
         The model represents a complete 32-step joint action chunk rather than
         choosing a single grasp point.  A context encoder fuses observed grasp
         pose, place goal, perception uncertainty, and a task-profile token.
-        A Transformer decoder then cross-attends from six-axis action tokens to
-        that context while estimating diffusion noise or a trajectory proposal.
+        A Transformer decoder then cross-attends from phase-aware six-axis action
+        tokens to that context while estimating diffusion noise or a trajectory proposal.
         """
 
         def __init__(self) -> None:
@@ -506,7 +528,9 @@ def build_denoiser(hidden_dim: int, diffusion_steps: int):
             )
             self.action_position_embedding = nn.Parameter(torch.zeros(1, TRAJECTORY_STEPS, hidden_dim))
             self.action_type_embedding = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+            self.process_phase_embedding = nn.Embedding(PHASE_COUNT, hidden_dim)
             self.prior_query = nn.Parameter(torch.zeros(1, TRAJECTORY_STEPS, hidden_dim))
+            self.register_buffer("task_phase_ids", torch.tensor(TASK_PHASE_IDS, dtype=torch.long), persistent=False)
             action_layer = nn.TransformerDecoderLayer(
                 d_model=hidden_dim,
                 nhead=4,
@@ -546,6 +570,11 @@ def build_denoiser(hidden_dim: int, diffusion_steps: int):
         def decode_action_chunk(self, action_tokens, context_tokens):
             return self.output_projection(self.action_decoder(action_tokens, context_tokens))
 
+        def action_phase_embedding(self, context):
+            task_ids = torch.argmax(context[:, 21 : 21 + TASK_COUNT], dim=1)
+            phase_ids = self.task_phase_ids[task_ids]
+            return self.process_phase_embedding(phase_ids)
+
         def forward(self, noisy_trajectory, time_index, context):
             if noisy_trajectory.ndim != 3 or noisy_trajectory.shape[1:] != (TRAJECTORY_STEPS, JOINT_COUNT):
                 raise ValueError(f"noisy_trajectory must have shape (batch, {TRAJECTORY_STEPS}, {JOINT_COUNT})")
@@ -559,12 +588,12 @@ def build_denoiser(hidden_dim: int, diffusion_steps: int):
                 time_embedding = torch.nn.functional.pad(time_embedding, (0, hidden_dim - time_embedding.shape[1]))
             action_tokens = self.state_projection(noisy_trajectory)
             action_tokens = action_tokens + self.time_projection(time_embedding).unsqueeze(1)
-            action_tokens = action_tokens + self.action_position_embedding + self.action_type_embedding
+            action_tokens = action_tokens + self.action_position_embedding + self.action_type_embedding + self.action_phase_embedding(context)
             return self.decode_action_chunk(action_tokens, self.encode_context(context))
 
         def predict_prior(self, context):
             action_queries = self.prior_query.expand(context.shape[0], -1, -1)
-            action_queries = action_queries + self.action_position_embedding + self.action_type_embedding
+            action_queries = action_queries + self.action_position_embedding + self.action_type_embedding + self.action_phase_embedding(context)
             return self.decode_action_chunk(action_queries, self.encode_context(context))
 
     return EmbodiedActionChunkTransformer()
@@ -638,6 +667,8 @@ def train_model(dataset_path: Path, checkpoint_path: Path, epochs: int, batch_si
             "context_tokens": list(CONTEXT_TOKEN_NAMES),
             "task_names": list(TASK_NAMES),
             "task_count": TASK_COUNT,
+            "phase_names": list(PHASE_NAMES),
+            "task_phase_ids": TASK_PHASE_IDS.tolist(),
             "action_chunk_length": TRAJECTORY_STEPS,
             "model_parameters": model_parameters,
             "joint_limit_rad": ASSUMED_JOINT_LIMIT_RAD,
@@ -685,6 +716,87 @@ def sample_trajectories(model, context, diffusion_steps: int, sample_count: int,
                     trajectory = math.sqrt(previous_alpha_bar) * predicted_x0 + math.sqrt(1.0 - previous_alpha_bar) * predicted_noise
             samples.append(trajectory.squeeze(0).cpu().numpy())
     return np.stack(samples, axis=0)
+
+
+def counterfactual_sensor_scales(context: np.ndarray, perception_noise_fraction: float) -> tuple[float, float, float]:
+    """Recover conservative perturbation scales from the policy context metadata."""
+    if not 0.0 < perception_noise_fraction <= 1.0:
+        raise ValueError("perception_noise_fraction must be in (0, 1]")
+    xy_sigma_m = max(float(context[19]) * 0.01 * perception_noise_fraction, 0.0005)
+    z_sigma_m = max(xy_sigma_m * 0.67, 0.0005)
+    yaw_sigma_rad = max(float(context[20]) * math.radians(10.0) * perception_noise_fraction, math.radians(0.25))
+    return xy_sigma_m, z_sigma_m, yaw_sigma_rad
+
+
+def evaluate_counterfactual_consensus(
+    model,
+    context_np: np.ndarray,
+    observed_grasp_pose: np.ndarray,
+    observed_place_pose: np.ndarray,
+    clean_grasp_pose: np.ndarray,
+    task_name: str,
+    scene: DiagnosticScene,
+    diffusion_steps: int,
+    rollouts: int,
+    minimum_safe_fraction: float,
+    perception_noise_fraction: float,
+    context_mean: np.ndarray,
+    context_std: np.ndarray,
+    support_threshold: float,
+    device,
+    rng: np.random.Generator,
+) -> dict[str, Any]:
+    """Evaluate a plan under counterfactual re-observations before accepting it.
+
+    Every rollout regenerates a plausible sensor observation, creates a fresh
+    policy action chunk, and projects it through the same kinematic and scene
+    shield. This is an offline robust-decision check, not a real-time control
+    loop or a substitute for real perception calibration.
+    """
+    if rollouts < 1:
+        raise ValueError("rollouts must be positive")
+    if not 0.0 < minimum_safe_fraction <= 1.0:
+        raise ValueError("minimum_safe_fraction must be in (0, 1]")
+    torch, _, _, _ = require_torch()
+    xy_sigma_m, z_sigma_m, yaw_sigma_rad = counterfactual_sensor_scales(context_np, perception_noise_fraction)
+    confidence = float(np.clip(context_np[18], 0.0, 1.0))
+    safe_rollouts = 0
+    endpoint_errors: list[float] = []
+    reasons: Counter[str] = Counter()
+    arm = load_default_model()
+    for _ in range(rollouts):
+        counterfactual_grasp = perturb_pose(rigidify_pose(observed_grasp_pose), rng, xy_sigma_m, z_sigma_m, yaw_sigma_rad)
+        counterfactual_place = perturb_pose(rigidify_pose(observed_place_pose), rng, xy_sigma_m, z_sigma_m, yaw_sigma_rad)
+        counterfactual_context = pose_to_context(
+            counterfactual_grasp,
+            counterfactual_place,
+            confidence,
+            float(context_np[19]) * 0.01,
+            float(context_np[20]) * math.radians(10.0),
+            task_name,
+        )
+        support_distance = float(np.linalg.norm((counterfactual_context.astype(np.float64) - context_mean) / context_std))
+        if support_distance > support_threshold:
+            reasons["counterfactual context outside training support"] += 1
+            continue
+        context = torch.tensor(counterfactual_context, dtype=torch.float32)
+        sample = sample_trajectories(model, context, diffusion_steps, 1, device)[0]
+        prediction = np.clip(sample * ASSUMED_JOINT_LIMIT_RAD, -ASSUMED_JOINT_LIMIT_RAD, ASSUMED_JOINT_LIMIT_RAD)
+        projected, failure = project_with_constraints(prediction, counterfactual_grasp, counterfactual_place, scene, task_name)
+        if projected is None:
+            reasons[failure or "counterfactual projection failed"] += 1
+            continue
+        safe_rollouts += 1
+        endpoint_errors.append(pose_position_error(arm, projected[GRASP_INDEX], clean_grasp_pose))
+    safe_fraction = safe_rollouts / rollouts
+    return {
+        "rollouts": rollouts,
+        "safe_rollouts": safe_rollouts,
+        "safe_fraction": safe_fraction,
+        "accepted": safe_fraction >= minimum_safe_fraction,
+        "mean_projected_grasp_error_m": float(np.mean(endpoint_errors)) if endpoint_errors else None,
+        "rejection_reasons": dict(sorted(reasons.items())),
+    }
 
 
 def project_with_constraints(
@@ -738,10 +850,26 @@ def pose_position_error(model, joint_angles: np.ndarray, target_pose: np.ndarray
     return float(np.linalg.norm(actual[:3, 3] - target_pose[:3, 3]))
 
 
-def evaluate_model(checkpoint_path: Path, dataset_path: Path, output_path: Path, samples_per_context: int, abstain_dispersion_rad: float, seed: int) -> dict[str, Any]:
+def evaluate_model(
+    checkpoint_path: Path,
+    dataset_path: Path,
+    output_path: Path,
+    samples_per_context: int,
+    abstain_dispersion_rad: float,
+    seed: int,
+    counterfactual_rollouts: int = 0,
+    minimum_counterfactual_safe_fraction: float = 0.75,
+    counterfactual_noise_fraction: float = 0.50,
+) -> dict[str, Any]:
     torch, _, _, _ = require_torch()
     if samples_per_context < 1 or not math.isfinite(abstain_dispersion_rad) or abstain_dispersion_rad <= 0.0:
         raise ValueError("invalid evaluation settings")
+    if counterfactual_rollouts < 0:
+        raise ValueError("counterfactual_rollouts must be non-negative")
+    if not 0.0 < minimum_counterfactual_safe_fraction <= 1.0:
+        raise ValueError("minimum_counterfactual_safe_fraction must be in (0, 1]")
+    if not 0.0 < counterfactual_noise_fraction <= 1.0:
+        raise ValueError("counterfactual_noise_fraction must be in (0, 1]")
     torch.manual_seed(seed)
     np.random.seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -755,6 +883,8 @@ def evaluate_model(checkpoint_path: Path, dataset_path: Path, output_path: Path,
         raise ValueError("checkpoint context dimension does not match the active multi-task model")
     if tuple(checkpoint.get("task_names", ())) != TASK_NAMES:
         raise ValueError("checkpoint task suite does not match the active multi-task benchmark")
+    if tuple(checkpoint.get("phase_names", ())) != PHASE_NAMES:
+        raise ValueError("checkpoint process-phase graph does not match the active multi-task benchmark")
     model = build_denoiser(int(checkpoint["hidden_dim"]), int(checkpoint["diffusion_steps"])).to(device)
     model.load_state_dict(checkpoint["state_dict"])
     data = np.load(dataset_path)
@@ -781,6 +911,10 @@ def evaluate_model(checkpoint_path: Path, dataset_path: Path, output_path: Path,
     dispersion_abstentions = 0
     projection_failures: list[str] = []
     examples: list[dict[str, object]] = []
+    counterfactual_reason_counts: Counter[str] = Counter()
+    counterfactual_safe_fractions: list[float] = []
+    counterfactual_accepted = 0
+    counterfactual_errors: list[float] = []
     task_records: dict[str, dict[str, Any]] = {
         task_name: {
             "episodes": 0,
@@ -792,6 +926,9 @@ def evaluate_model(checkpoint_path: Path, dataset_path: Path, output_path: Path,
             "ood_abstentions": 0,
             "dispersion_abstentions": 0,
             "projection_failures": 0,
+            "counterfactual_safe_fractions": [],
+            "counterfactual_accepted": 0,
+            "counterfactual_errors": [],
         }
         for task_name in TASK_NAMES
     }
@@ -809,6 +946,35 @@ def evaluate_model(checkpoint_path: Path, dataset_path: Path, output_path: Path,
         raw_review = review_tcp_positions(trajectory_tcp_positions(arm, prediction), scene)
         raw_scene_safe += int(raw_review.safe)
         record["raw_safe"] += int(raw_review.safe)
+        if counterfactual_rollouts:
+            consensus = evaluate_counterfactual_consensus(
+                model,
+                context_np,
+                observed_grasp[index],
+                observed_place[index],
+                clean_grasp[index],
+                task_name,
+                scene,
+                int(checkpoint["diffusion_steps"]),
+                counterfactual_rollouts,
+                minimum_counterfactual_safe_fraction,
+                counterfactual_noise_fraction,
+                context_mean,
+                context_std,
+                support_threshold,
+                device,
+                np.random.default_rng(seed * 100_003 + index),
+            )
+            counterfactual_safe_fractions.append(float(consensus["safe_fraction"]))
+            record["counterfactual_safe_fractions"].append(float(consensus["safe_fraction"]))
+            if consensus["accepted"]:
+                counterfactual_accepted += 1
+                record["counterfactual_accepted"] += 1
+            if consensus["mean_projected_grasp_error_m"] is not None:
+                error = float(consensus["mean_projected_grasp_error_m"])
+                counterfactual_errors.append(error)
+                record["counterfactual_errors"].append(error)
+            counterfactual_reason_counts.update(consensus["rejection_reasons"])
         support_distance = float(np.linalg.norm((context_np.astype(np.float64) - context_mean) / context_std))
         if support_distance > support_threshold:
             abstentions += 1
@@ -874,6 +1040,14 @@ def evaluate_model(checkpoint_path: Path, dataset_path: Path, output_path: Path,
             "dispersion_abstention_rate": record["dispersion_abstentions"] / episodes,
             "projection_failure_rate": record["projection_failures"] / episodes,
         }
+        if counterfactual_rollouts:
+            task_metrics[task_name].update(
+                {
+                    "counterfactual_consensus_rate": record["counterfactual_accepted"] / episodes,
+                    "counterfactual_mean_safe_rollout_rate": float(np.mean(record["counterfactual_safe_fractions"])),
+                    "counterfactual_mean_projected_grasp_error_m": float(np.mean(record["counterfactual_errors"])) if record["counterfactual_errors"] else None,
+                }
+            )
     report = {
         "evaluation": "constraint_diffusion_digital_twin",
         "architecture": ARCHITECTURE_NAME,
@@ -888,6 +1062,16 @@ def evaluate_model(checkpoint_path: Path, dataset_path: Path, output_path: Path,
         "samples_per_context": samples_per_context,
         "abstain_dispersion_rad": abstain_dispersion_rad,
         "context_support_threshold": support_threshold,
+        "counterfactual_consensus": {
+            "enabled": bool(counterfactual_rollouts),
+            "rollouts_per_episode": counterfactual_rollouts,
+            "minimum_safe_fraction": minimum_counterfactual_safe_fraction,
+            "perception_noise_fraction": counterfactual_noise_fraction,
+            "accepted_rate": counterfactual_accepted / len(contexts) if counterfactual_rollouts else None,
+            "mean_safe_rollout_rate": float(np.mean(counterfactual_safe_fractions)) if counterfactual_safe_fractions else None,
+            "mean_projected_grasp_error_m": float(np.mean(counterfactual_errors)) if counterfactual_errors else None,
+            "rejection_reason_counts": dict(sorted(counterfactual_reason_counts.items())),
+        },
         "metrics": {
             "raw_mean_grasp_position_error_m": float(np.mean(raw_errors)),
             "raw_scene_safe_rate": raw_scene_safe / len(contexts),
@@ -954,6 +1138,9 @@ def main() -> int:
     evaluate.add_argument("--samples-per-context", type=int, default=3)
     evaluate.add_argument("--abstain-dispersion-rad", type=float, default=0.45)
     evaluate.add_argument("--seed", type=int, default=20260815)
+    evaluate.add_argument("--counterfactual-rollouts", type=int, default=0, help="additional perception rollouts used for robust plan consensus")
+    evaluate.add_argument("--minimum-counterfactual-safe-fraction", type=float, default=0.75)
+    evaluate.add_argument("--counterfactual-noise-fraction", type=float, default=0.50)
 
     args = parser.parse_args()
     if args.command == "generate":
@@ -965,7 +1152,17 @@ def main() -> int:
     elif args.command == "train":
         result = train_model(args.dataset, args.checkpoint, args.epochs, args.batch_size, args.hidden_dim, args.diffusion_steps, args.seed)
     else:
-        result = evaluate_model(args.checkpoint, args.dataset, args.output, args.samples_per_context, args.abstain_dispersion_rad, args.seed)
+        result = evaluate_model(
+            args.checkpoint,
+            args.dataset,
+            args.output,
+            args.samples_per_context,
+            args.abstain_dispersion_rad,
+            args.seed,
+            args.counterfactual_rollouts,
+            args.minimum_counterfactual_safe_fraction,
+            args.counterfactual_noise_fraction,
+        )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

@@ -14,7 +14,7 @@ if (-not (Test-Path -LiteralPath $PythonPath)) {
 
 Set-Location -LiteralPath $root
 $runtime = Join-Path $root "runtime\constraint_diffusion"
-$checkpoint = Join-Path $runtime "multitask_action_chunk_transformer_policy.pt"
+$checkpoint = Join-Path $runtime "process_graph_multitask_action_chunk_transformer_policy.pt"
 $train = Join-Path $runtime "multitask_train.npz"
 $test = Join-Path $runtime "multitask_test.npz"
 $shift = Join-Path $runtime "multitask_test_shift.npz"
@@ -25,6 +25,6 @@ $shiftReport = Join-Path $runtime "multitask_evaluation_shift.json"
 & $PythonPath tools\constraint_diffusion_twin.py generate --output $test --count $TestCount --seed 20260816 --tasks $TaskSuite
 & $PythonPath tools\constraint_diffusion_twin.py generate --output $shift --count $TestCount --seed 20260817 --xy-sigma-m 0.008 --z-sigma-m 0.004 --yaw-sigma-deg 5.0 --tasks $TaskSuite
 & $PythonPath tools\constraint_diffusion_twin.py train --dataset $train --checkpoint $checkpoint --epochs $Epochs --batch-size 64 --hidden-dim 128 --diffusion-steps 16 --seed 20260815
-& $PythonPath tools\constraint_diffusion_twin.py evaluate --checkpoint $checkpoint --dataset $test --output $nominalReport --samples-per-context 3 --abstain-dispersion-rad 0.45 --seed 20260815
-& $PythonPath tools\constraint_diffusion_twin.py evaluate --checkpoint $checkpoint --dataset $shift --output $shiftReport --samples-per-context 3 --abstain-dispersion-rad 0.45 --seed 20260815
+& $PythonPath tools\constraint_diffusion_twin.py evaluate --checkpoint $checkpoint --dataset $test --output $nominalReport --samples-per-context 3 --abstain-dispersion-rad 0.45 --seed 20260815 --counterfactual-rollouts 4 --minimum-counterfactual-safe-fraction 0.75 --counterfactual-noise-fraction 0.50
+& $PythonPath tools\constraint_diffusion_twin.py evaluate --checkpoint $checkpoint --dataset $shift --output $shiftReport --samples-per-context 3 --abstain-dispersion-rad 0.45 --seed 20260815 --counterfactual-rollouts 4 --minimum-counterfactual-safe-fraction 0.75 --counterfactual-noise-fraction 0.50
 & $PythonPath tools\render_multitask_factory_cell_dashboard.py --checkpoint $checkpoint --nominal $nominalReport --shift $shiftReport --dataset $test --output assets\multitask_factory_cell_dashboard.png

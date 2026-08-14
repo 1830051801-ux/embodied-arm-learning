@@ -17,8 +17,11 @@ from constraint_diffusion_twin import (
     CONTEXT_TOKEN_NAMES,
     GRASP_INDEX,
     PLACE_INDEX,
+    TASK_COUNT,
+    TASK_NAMES,
     TRAJECTORY_STEPS,
     build_expert_trajectory,
+    build_task_trajectory,
     pose_to_context,
     rigidify_pose,
 )
@@ -26,12 +29,13 @@ from constraint_diffusion_twin import (
 
 class ConstraintDiffusionTwinTests(unittest.TestCase):
     def test_action_chunk_transformer_contract_is_explicit(self) -> None:
-        self.assertEqual(ARCHITECTURE_NAME, "embodied_action_chunk_transformer_diffusion")
+        self.assertEqual(ARCHITECTURE_NAME, "multitask_embodied_action_chunk_transformer_diffusion")
         self.assertEqual(
             CONTEXT_TOKEN_NAMES,
-            ("visual_grasp_pose", "visual_place_goal", "observation_uncertainty", "learned_task_token"),
+            ("visual_grasp_pose", "visual_place_goal", "observation_uncertainty", "task_profile", "learned_task_token"),
         )
-        self.assertEqual(CONTEXT_DIM, 21)
+        self.assertEqual(TASK_COUNT, 5)
+        self.assertEqual(CONTEXT_DIM, 21 + TASK_COUNT)
 
     def test_quintic_trajectory_preserves_keyframe_anchors(self) -> None:
         home = np.zeros(6)
@@ -60,9 +64,22 @@ class ConstraintDiffusionTwinTests(unittest.TestCase):
         place = np.eye(4)
         grasp[:3, 3] = [0.25, -0.12, 0.30]
         place[:3, 3] = [0.28, -0.08, 0.30]
-        context = pose_to_context(grasp, place, 0.92, 0.003, np.deg2rad(2.0))
-        self.assertEqual(context.shape, (21,))
+        context = pose_to_context(grasp, place, 0.92, 0.003, np.deg2rad(2.0), "precision_insert")
+        self.assertEqual(context.shape, (26,))
+        self.assertEqual(int(np.argmax(context[21:])), TASK_NAMES.index("precision_insert"))
+        self.assertAlmostEqual(float(context[21:].sum()), 1.0)
         self.assertTrue(np.isfinite(context).all())
+
+    def test_multitask_trajectory_preserves_contact_keyframes(self) -> None:
+        home = np.zeros(6)
+        grasp = np.array([0.20, -0.10, 0.15, -0.05, 0.08, -0.03])
+        place = np.array([-0.12, 0.11, -0.14, 0.06, -0.07, 0.04])
+        approach_grasp = grasp * 0.7
+        approach_place = place * 0.7
+        trajectory = build_task_trajectory(home, grasp, place, approach_grasp, approach_place, "precision_insert")
+        np.testing.assert_allclose(trajectory[GRASP_INDEX], grasp)
+        np.testing.assert_allclose(trajectory[PLACE_INDEX], place)
+        np.testing.assert_allclose(trajectory[-1], home)
 
 
 if __name__ == "__main__":

@@ -34,12 +34,22 @@ JOINT_COUNT = 6
 GRASP_INDEX = 10
 PLACE_INDEX = 23
 ASSUMED_JOINT_LIMIT_RAD = 1.20
-CONTEXT_DIM = 21
-ARCHITECTURE_NAME = "embodied_action_chunk_transformer_diffusion"
+TASK_NAMES = (
+    "transfer",
+    "sort_zone_a",
+    "sort_zone_b",
+    "inspection_scan",
+    "precision_insert",
+)
+TASK_TO_ID = {name: index for index, name in enumerate(TASK_NAMES)}
+TASK_COUNT = len(TASK_NAMES)
+CONTEXT_DIM = 21 + TASK_COUNT
+ARCHITECTURE_NAME = "multitask_embodied_action_chunk_transformer_diffusion"
 CONTEXT_TOKEN_NAMES = (
     "visual_grasp_pose",
     "visual_place_goal",
     "observation_uncertainty",
+    "task_profile",
     "learned_task_token",
 )
 
@@ -64,7 +74,33 @@ def rotation_z(angle_rad: float) -> np.ndarray:
     )
 
 
-def pose_to_context(grasp_pose: np.ndarray, place_pose: np.ndarray, confidence: float, xy_sigma_m: float, yaw_sigma_rad: float) -> np.ndarray:
+def task_id_from_name(task_name: str) -> int:
+    try:
+        return TASK_TO_ID[task_name]
+    except KeyError as exc:
+        raise ValueError(f"unknown task profile {task_name!r}; expected one of {', '.join(TASK_NAMES)}") from exc
+
+
+def task_name_from_id(task_id: int) -> str:
+    if not 0 <= int(task_id) < TASK_COUNT:
+        raise ValueError(f"invalid task id {task_id}")
+    return TASK_NAMES[int(task_id)]
+
+
+def task_one_hot(task_name: str) -> np.ndarray:
+    one_hot = np.zeros(TASK_COUNT, dtype=np.float64)
+    one_hot[task_id_from_name(task_name)] = 1.0
+    return one_hot
+
+
+def pose_to_context(
+    grasp_pose: np.ndarray,
+    place_pose: np.ndarray,
+    confidence: float,
+    xy_sigma_m: float,
+    yaw_sigma_rad: float,
+    task_name: str = "transfer",
+) -> np.ndarray:
     grasp_rotation6d = grasp_pose[:3, :2].reshape(-1)
     place_rotation6d = place_pose[:3, :2].reshape(-1)
     context = np.concatenate(
@@ -74,6 +110,7 @@ def pose_to_context(grasp_pose: np.ndarray, place_pose: np.ndarray, confidence: 
             place_pose[:3, 3] / 0.5,
             place_rotation6d,
             np.array([confidence, xy_sigma_m / 0.01, yaw_sigma_rad / math.radians(10.0)], dtype=np.float64),
+            task_one_hot(task_name),
         ]
     )
     if context.shape != (CONTEXT_DIM,) or not np.isfinite(context).all():
@@ -95,6 +132,24 @@ def build_expert_trajectory(home: np.ndarray, grasp: np.ndarray, place: np.ndarr
         tau = np.linspace(0.0, 1.0, end_index - start_index + 1, dtype=np.float64)
         blend = quintic_blend(tau)[:, None]
         trajectory[start_index : end_index + 1] = start + blend * (end - start)
+    return trajectory
+
+
+def build_piecewise_trajectory(anchors: list[tuple[int, np.ndarray]]) -> np.ndarray:
+    """Interpolate an ordered joint-space process trajectory through fixed stages."""
+    if len(anchors) < 2 or anchors[0][0] != 0 or anchors[-1][0] != TRAJECTORY_STEPS - 1:
+        raise ValueError("trajectory anchors must start at zero and end at the final action step")
+    previous_index = -1
+    trajectory = np.zeros((TRAJECTORY_STEPS, JOINT_COUNT), dtype=np.float64)
+    for index, angles in anchors:
+        if not previous_index < index < TRAJECTORY_STEPS:
+            raise ValueError("trajectory anchor indices must be strictly increasing and in range")
+        if np.asarray(angles).shape != (JOINT_COUNT,) or not np.isfinite(angles).all():
+            raise ValueError("every trajectory anchor must contain six finite joint angles")
+        previous_index = index
+    for (start_index, start), (end_index, end) in zip(anchors, anchors[1:]):
+        tau = np.linspace(0.0, 1.0, end_index - start_index + 1, dtype=np.float64)
+        trajectory[start_index : end_index + 1] = start + quintic_blend(tau)[:, None] * (end - start)
     return trajectory
 
 
@@ -139,6 +194,8 @@ class DatasetSettings:
     xy_sigma_m: float
     z_sigma_m: float
     yaw_sigma_deg: float
+    tasks: tuple[str, ...] = TASK_NAMES
+    domain_randomization: bool = False
 
     def __post_init__(self) -> None:
         if self.count < 1:
@@ -146,46 +203,206 @@ class DatasetSettings:
         values = (self.xy_sigma_m, self.z_sigma_m, self.yaw_sigma_deg)
         if not all(math.isfinite(value) and value >= 0.0 for value in values):
             raise ValueError("noise settings must be finite and non-negative")
+        if not self.tasks or len(set(self.tasks)) != len(self.tasks):
+            raise ValueError("tasks must contain at least one unique task profile")
+        for task_name in self.tasks:
+            task_id_from_name(task_name)
+
+
+@dataclass(frozen=True)
+class TaskProfile:
+    name: str
+    description: str
+    approach_height_m: float
+    place_y_min_m: float | None = None
+    place_y_max_m: float | None = None
+    place_z_max_m: float | None = None
+
+
+TASK_PROFILES = {
+    "transfer": TaskProfile("transfer", "general target-to-target transfer", 0.04),
+    "sort_zone_a": TaskProfile("sort_zone_a", "transfer into simulated placement zone A", 0.04, place_y_min_m=-0.08),
+    "sort_zone_b": TaskProfile("sort_zone_b", "transfer into simulated placement zone B", 0.04, place_y_max_m=-0.16),
+    "inspection_scan": TaskProfile("inspection_scan", "two-view visual inspection scan", 0.05),
+    "precision_insert": TaskProfile("precision_insert", "slow final insertion and dwell", 0.025, place_y_min_m=-0.17, place_y_max_m=-0.04, place_z_max_m=0.25),
+}
+
+
+def task_profile(task_name: str) -> TaskProfile:
+    task_id_from_name(task_name)
+    return TASK_PROFILES[task_name]
+
+
+def pose_matches_task_profile(place_pose: np.ndarray, profile: TaskProfile) -> bool:
+    _, y_m, z_m = place_pose[:3, 3]
+    if profile.place_y_min_m is not None and y_m < profile.place_y_min_m:
+        return False
+    if profile.place_y_max_m is not None and y_m > profile.place_y_max_m:
+        return False
+    if profile.place_z_max_m is not None and z_m > profile.place_z_max_m:
+        return False
+    return True
+
+
+def pose_with_vertical_clearance(pose: np.ndarray, clearance_m: float) -> np.ndarray:
+    result = rigidify_pose(pose)
+    result[:3, 3][2] += clearance_m
+    return result
+
+
+def diagnostic_joint_limits() -> JointLimits:
+    return JointLimits(
+        position_min=np.full(JOINT_COUNT, -ASSUMED_JOINT_LIMIT_RAD),
+        position_max=np.full(JOINT_COUNT, ASSUMED_JOINT_LIMIT_RAD),
+        velocity_max=np.full(JOINT_COUNT, 0.4),
+        acceleration_max=np.full(JOINT_COUNT, 0.8),
+    )
+
+
+def solve_pose_ik(model, limits: JointLimits, target_pose: np.ndarray, seed: np.ndarray):
+    bounded_seed = np.clip(np.asarray(seed, dtype=np.float64), limits.position_min, limits.position_max)
+    offsets = (
+        np.zeros(JOINT_COUNT, dtype=np.float64),
+        np.array([0.0, -0.35, 0.35, 0.0, 0.0, 0.0]),
+        np.array([0.0, 0.35, -0.35, 0.0, 0.0, 0.0]),
+        np.array([0.0, -0.70, 0.70, 0.0, 0.0, 0.0]),
+        np.array([0.0, 0.70, -0.70, 0.0, 0.0, 0.0]),
+    )
+    candidate_seeds = [np.clip(bounded_seed + offset, limits.position_min, limits.position_max) for offset in offsets]
+    candidate_seeds.append(np.zeros(JOINT_COUNT, dtype=np.float64))
+    return ik_space_multistart(
+        model.home_grasp_tcp,
+        model.screw_axes,
+        rigidify_pose(target_pose),
+        candidate_seeds,
+        preferred_angles=bounded_seed,
+        joint_lower=limits.position_min,
+        joint_upper=limits.position_max,
+        orientation_tolerance_rad=2e-4,
+        position_tolerance_m=2e-4,
+        max_iterations=250,
+        max_step_rad=0.15,
+    )
+
+
+def build_task_trajectory(
+    home: np.ndarray,
+    grasp: np.ndarray,
+    place: np.ndarray,
+    approach_grasp: np.ndarray,
+    approach_place: np.ndarray,
+    task_name: str,
+) -> np.ndarray:
+    """Build an approach, contact, transfer, and retreat trajectory for one task profile."""
+    task_id_from_name(task_name)
+    if task_name == "inspection_scan":
+        anchors = [
+            (0, home), (6, approach_grasp), (GRASP_INDEX, grasp), (15, approach_grasp),
+            (20, approach_place), (PLACE_INDEX, place), (27, approach_place), (TRAJECTORY_STEPS - 1, home),
+        ]
+    elif task_name == "precision_insert":
+        anchors = [
+            (0, home), (6, approach_grasp), (GRASP_INDEX, grasp), (14, approach_grasp),
+            (20, approach_place), (PLACE_INDEX, place), (26, place), (TRAJECTORY_STEPS - 1, home),
+        ]
+    elif task_name == "sort_zone_a":
+        anchors = [
+            (0, home), (4, approach_grasp), (GRASP_INDEX, grasp), (13, approach_grasp),
+            (18, approach_place), (PLACE_INDEX, place), (27, approach_place), (TRAJECTORY_STEPS - 1, home),
+        ]
+    elif task_name == "sort_zone_b":
+        anchors = [
+            (0, home), (7, approach_grasp), (GRASP_INDEX, grasp), (15, approach_grasp),
+            (20, approach_place), (PLACE_INDEX, place), (28, approach_place), (TRAJECTORY_STEPS - 1, home),
+        ]
+    else:
+        anchors = [
+            (0, home), (5, approach_grasp), (GRASP_INDEX, grasp), (14, approach_grasp),
+            (19, approach_place), (PLACE_INDEX, place), (27, approach_place), (TRAJECTORY_STEPS - 1, home),
+        ]
+    return build_piecewise_trajectory(anchors)
+
+
+def balanced_task_schedule(count: int, tasks: tuple[str, ...], rng: np.random.Generator) -> list[str]:
+    schedule = [tasks[index % len(tasks)] for index in range(count)]
+    rng.shuffle(schedule)
+    return schedule
 
 
 def generate_dataset(output_path: Path, settings: DatasetSettings, scene: DiagnosticScene) -> dict[str, Any]:
     rng = np.random.default_rng(settings.seed)
     model = load_default_model()
     home = np.zeros(JOINT_COUNT, dtype=np.float64)
+    limits = diagnostic_joint_limits()
     trajectories: list[np.ndarray] = []
     contexts: list[np.ndarray] = []
+    task_ids: list[int] = []
     clean_grasp_poses: list[np.ndarray] = []
     clean_place_poses: list[np.ndarray] = []
     observed_grasp_poses: list[np.ndarray] = []
     observed_place_poses: list[np.ndarray] = []
     attempts = 0
     max_attempts = settings.count * 200
-    yaw_sigma_rad = math.radians(settings.yaw_sigma_deg)
+    task_schedule = balanced_task_schedule(settings.count, settings.tasks, rng)
+    attempts_by_task = {task_name: 0 for task_name in settings.tasks}
 
     while len(trajectories) < settings.count:
         attempts += 1
         if attempts > max_attempts:
             raise RuntimeError(f"only generated {len(trajectories)}/{settings.count} safe episodes after {attempts} attempts")
+        task_name = task_schedule[len(trajectories)]
+        profile = task_profile(task_name)
+        attempts_by_task[task_name] += 1
         # Keep the synthetic expert data inside a conservative portion of the
         # unmeasured joint envelope. Larger excursions are evaluated later as
         # distribution shift rather than silently treated as calibrated motion.
         grasp = rng.uniform(-0.42, 0.42, size=JOINT_COUNT)
         place = rng.uniform(-0.42, 0.42, size=JOINT_COUNT)
-        trajectory = build_expert_trajectory(home, grasp, place)
-        if np.max(np.abs(trajectory)) > ASSUMED_JOINT_LIMIT_RAD:
-            continue
         clean_grasp = fk_space(model.home_grasp_tcp, model.screw_axes, grasp)
         clean_place = fk_space(model.home_grasp_tcp, model.screw_axes, place)
-        if not pose_is_in_diagnostic_workspace(clean_grasp) or not pose_is_in_diagnostic_workspace(clean_place):
+        if (
+            not pose_is_in_diagnostic_workspace(clean_grasp)
+            or not pose_is_in_diagnostic_workspace(clean_place)
+            or not pose_matches_task_profile(clean_place, profile)
+        ):
+            continue
+        approach_grasp_pose = pose_with_vertical_clearance(clean_grasp, profile.approach_height_m)
+        approach_place_pose = pose_with_vertical_clearance(clean_place, profile.approach_height_m)
+        if not pose_is_in_diagnostic_workspace(approach_grasp_pose) or not pose_is_in_diagnostic_workspace(approach_place_pose):
+            continue
+        approach_grasp_result = solve_pose_ik(model, limits, approach_grasp_pose, grasp)
+        approach_place_result = solve_pose_ik(model, limits, approach_place_pose, place)
+        if not approach_grasp_result.converged or not approach_place_result.converged:
+            continue
+        trajectory = build_task_trajectory(
+            home,
+            grasp,
+            place,
+            approach_grasp_result.joint_angles,
+            approach_place_result.joint_angles,
+            task_name,
+        )
+        if np.max(np.abs(trajectory)) > ASSUMED_JOINT_LIMIT_RAD:
             continue
         review = review_tcp_positions(trajectory_tcp_positions(model, trajectory), scene)
         if not review.safe:
             continue
-        observed_grasp = perturb_pose(clean_grasp, rng, settings.xy_sigma_m, settings.z_sigma_m, yaw_sigma_rad)
-        observed_place = perturb_pose(clean_place, rng, settings.xy_sigma_m, settings.z_sigma_m, yaw_sigma_rad)
-        confidence = float(rng.uniform(0.80, 0.99))
+        if settings.domain_randomization:
+            noise_scale = float(rng.uniform(0.55, 1.45))
+            xy_sigma_m = settings.xy_sigma_m * noise_scale
+            z_sigma_m = settings.z_sigma_m * noise_scale
+            yaw_sigma_rad = math.radians(settings.yaw_sigma_deg * noise_scale)
+            confidence = float(rng.uniform(0.68, 0.99))
+        else:
+            xy_sigma_m = settings.xy_sigma_m
+            z_sigma_m = settings.z_sigma_m
+            yaw_sigma_rad = math.radians(settings.yaw_sigma_deg)
+            confidence = float(rng.uniform(0.80, 0.99))
+        observed_grasp = perturb_pose(clean_grasp, rng, xy_sigma_m, z_sigma_m, yaw_sigma_rad)
+        observed_place = perturb_pose(clean_place, rng, xy_sigma_m, z_sigma_m, yaw_sigma_rad)
         trajectories.append((trajectory / ASSUMED_JOINT_LIMIT_RAD).astype(np.float32))
-        contexts.append(pose_to_context(observed_grasp, observed_place, confidence, settings.xy_sigma_m, yaw_sigma_rad))
+        contexts.append(pose_to_context(observed_grasp, observed_place, confidence, xy_sigma_m, yaw_sigma_rad, task_name))
+        task_ids.append(task_id_from_name(task_name))
         clean_grasp_poses.append(clean_grasp.astype(np.float32))
         clean_place_poses.append(clean_place.astype(np.float32))
         observed_grasp_poses.append(observed_grasp.astype(np.float32))
@@ -196,6 +413,7 @@ def generate_dataset(output_path: Path, settings: DatasetSettings, scene: Diagno
         output_path,
         trajectories=np.stack(trajectories),
         contexts=np.stack(contexts),
+        task_ids=np.asarray(task_ids, dtype=np.int8),
         clean_grasp_poses=np.stack(clean_grasp_poses),
         clean_place_poses=np.stack(clean_place_poses),
         observed_grasp_poses=np.stack(observed_grasp_poses),
@@ -213,6 +431,14 @@ def generate_dataset(output_path: Path, settings: DatasetSettings, scene: Diagno
             "z_sigma_m": settings.z_sigma_m,
             "yaw_sigma_deg": settings.yaw_sigma_deg,
         },
+        "task_suite": list(settings.tasks),
+        "task_counts": {task_name: task_ids.count(task_id_from_name(task_name)) for task_name in settings.tasks},
+        "attempts_by_task": attempts_by_task,
+        "domain_randomization": {
+            "enabled": settings.domain_randomization,
+            "noise_scale_range": [0.55, 1.45] if settings.domain_randomization else [1.0, 1.0],
+            "confidence_range": [0.68, 0.99] if settings.domain_randomization else [0.80, 0.99],
+        },
         "scene": "offline_diagnostic_scene.json",
         "real_motion_enabled": False,
     }
@@ -227,11 +453,11 @@ def build_denoiser(hidden_dim: int, diffusion_steps: int):
         raise ValueError("hidden_dim must be at least 16 and divisible by four")
 
     class EmbodiedActionChunkTransformer(nn.Module):
-        """ACT-style chunk decoder conditioned on visual-goal-uncertainty tokens.
+        """ACT-style chunk decoder conditioned on visual, uncertainty, and task tokens.
 
         The model represents a complete 32-step joint action chunk rather than
         choosing a single grasp point.  A context encoder fuses observed grasp
-        pose, place goal, and perception uncertainty with a learned task token.
+        pose, place goal, perception uncertainty, and a task-profile token.
         A Transformer decoder then cross-attends from six-axis action tokens to
         that context while estimating diffusion noise or a trajectory proposal.
         """
@@ -250,6 +476,11 @@ def build_denoiser(hidden_dim: int, diffusion_steps: int):
             )
             self.uncertainty_projection = nn.Sequential(
                 nn.Linear(3, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.task_profile_projection = nn.Sequential(
+                nn.Linear(TASK_COUNT, hidden_dim),
                 nn.SiLU(),
                 nn.Linear(hidden_dim, hidden_dim),
             )
@@ -307,8 +538,9 @@ def build_denoiser(hidden_dim: int, diffusion_steps: int):
             grasp_token = self.visual_grasp_projection(context[:, 0:9])
             goal_token = self.visual_goal_projection(context[:, 9:18])
             uncertainty_token = self.uncertainty_projection(context[:, 18:21])
+            task_profile_token = self.task_profile_projection(context[:, 21 : 21 + TASK_COUNT])
             task_token = self.task_token.expand(context.shape[0], -1, -1).squeeze(1)
-            tokens = torch.stack((grasp_token, goal_token, uncertainty_token, task_token), dim=1)
+            tokens = torch.stack((grasp_token, goal_token, uncertainty_token, task_profile_token, task_token), dim=1)
             return self.context_encoder(tokens + self.context_type_embedding)
 
         def decode_action_chunk(self, action_tokens, context_tokens):
@@ -355,6 +587,8 @@ def train_model(dataset_path: Path, checkpoint_path: Path, epochs: int, batch_si
     data = np.load(dataset_path)
     trajectories = torch.tensor(data["trajectories"], dtype=torch.float32)
     contexts = torch.tensor(data["contexts"], dtype=torch.float32)
+    if contexts.ndim != 2 or contexts.shape[1] != CONTEXT_DIM:
+        raise ValueError(f"dataset contexts must have shape (episodes, {CONTEXT_DIM})")
     context_np = data["contexts"].astype(np.float64)
     context_mean = context_np.mean(axis=0)
     # Some context fields describe declared sensor noise and are intentionally
@@ -365,6 +599,7 @@ def train_model(dataset_path: Path, checkpoint_path: Path, epochs: int, batch_si
     support_threshold = float(np.quantile(support_distances, 0.995))
     loader = DataLoader(TensorDataset(trajectories, contexts), batch_size=batch_size, shuffle=True, drop_last=False)
     model = build_denoiser(hidden_dim, diffusion_steps).to(device)
+    model_parameters = sum(parameter.numel() for parameter in model.parameters())
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
     schedule = diffusion_schedule(torch, diffusion_steps, device)
     losses: list[float] = []
@@ -401,7 +636,10 @@ def train_model(dataset_path: Path, checkpoint_path: Path, epochs: int, batch_si
             "context_dim": CONTEXT_DIM,
             "architecture": ARCHITECTURE_NAME,
             "context_tokens": list(CONTEXT_TOKEN_NAMES),
+            "task_names": list(TASK_NAMES),
+            "task_count": TASK_COUNT,
             "action_chunk_length": TRAJECTORY_STEPS,
+            "model_parameters": model_parameters,
             "joint_limit_rad": ASSUMED_JOINT_LIMIT_RAD,
             "context_mean": context_mean.astype(np.float32),
             "context_std": context_std.astype(np.float32),
@@ -417,6 +655,7 @@ def train_model(dataset_path: Path, checkpoint_path: Path, epochs: int, batch_si
         "final_loss": losses[-1],
         "initial_loss": losses[0],
         "dataset_episodes": int(trajectories.shape[0]),
+        "model_parameters": model_parameters,
         "context_support_threshold": support_threshold,
         "checkpoint": str(checkpoint_path),
     }
@@ -448,47 +687,46 @@ def sample_trajectories(model, context, diffusion_steps: int, sample_count: int,
     return np.stack(samples, axis=0)
 
 
-def project_with_constraints(prediction: np.ndarray, observed_grasp_pose: np.ndarray, observed_place_pose: np.ndarray, scene: DiagnosticScene):
+def project_with_constraints(
+    prediction: np.ndarray,
+    observed_grasp_pose: np.ndarray,
+    observed_place_pose: np.ndarray,
+    scene: DiagnosticScene,
+    task_name: str,
+):
+    profile = task_profile(task_name)
     model = load_default_model()
-    limits = JointLimits(
-        position_min=np.full(JOINT_COUNT, -ASSUMED_JOINT_LIMIT_RAD),
-        position_max=np.full(JOINT_COUNT, ASSUMED_JOINT_LIMIT_RAD),
-        velocity_max=np.full(JOINT_COUNT, 0.4),
-        acceleration_max=np.full(JOINT_COUNT, 0.8),
+    limits = diagnostic_joint_limits()
+    grasp_pose = rigidify_pose(observed_grasp_pose)
+    place_pose = rigidify_pose(observed_place_pose)
+    if not pose_is_in_diagnostic_workspace(grasp_pose) or not pose_is_in_diagnostic_workspace(place_pose):
+        return None, "observed pose outside diagnostic workspace"
+    if not pose_matches_task_profile(place_pose, profile):
+        return None, "observed place pose outside selected task profile"
+    grasp_result = solve_pose_ik(model, limits, grasp_pose, prediction[GRASP_INDEX])
+    if not grasp_result.converged:
+        return None, "IK projection failed at grasp"
+    place_result = solve_pose_ik(model, limits, place_pose, prediction[PLACE_INDEX])
+    if not place_result.converged:
+        return None, "IK projection failed at place"
+    approach_grasp_pose = pose_with_vertical_clearance(grasp_pose, profile.approach_height_m)
+    approach_place_pose = pose_with_vertical_clearance(place_pose, profile.approach_height_m)
+    if not pose_is_in_diagnostic_workspace(approach_grasp_pose) or not pose_is_in_diagnostic_workspace(approach_place_pose):
+        return None, "approach pose outside diagnostic workspace"
+    approach_grasp_result = solve_pose_ik(model, limits, approach_grasp_pose, grasp_result.joint_angles)
+    if not approach_grasp_result.converged:
+        return None, "IK projection failed at grasp approach"
+    approach_place_result = solve_pose_ik(model, limits, approach_place_pose, place_result.joint_angles)
+    if not approach_place_result.converged:
+        return None, "IK projection failed at place approach"
+    trajectory = build_task_trajectory(
+        np.zeros(JOINT_COUNT),
+        grasp_result.joint_angles,
+        place_result.joint_angles,
+        approach_grasp_result.joint_angles,
+        approach_place_result.joint_angles,
+        task_name,
     )
-    anchors: list[np.ndarray] = []
-    for target_pose, seed in ((rigidify_pose(observed_grasp_pose), prediction[GRASP_INDEX]), (rigidify_pose(observed_place_pose), prediction[PLACE_INDEX])):
-        bounded_seed = np.clip(seed, limits.position_min, limits.position_max)
-        offsets = (
-            np.zeros(JOINT_COUNT, dtype=np.float64),
-            np.array([0.0, -0.35, 0.35, 0.0, 0.0, 0.0]),
-            np.array([0.0, 0.35, -0.35, 0.0, 0.0, 0.0]),
-            np.array([0.0, -0.70, 0.70, 0.0, 0.0, 0.0]),
-            np.array([0.0, 0.70, -0.70, 0.0, 0.0, 0.0]),
-        )
-        candidate_seeds = [bounded_seed]
-        candidate_seeds.extend(
-            np.clip(bounded_seed + offset, limits.position_min, limits.position_max)
-            for offset in offsets[1:]
-        )
-        candidate_seeds.append(np.zeros(JOINT_COUNT, dtype=np.float64))
-        result = ik_space_multistart(
-            model.home_grasp_tcp,
-            model.screw_axes,
-            target_pose,
-            candidate_seeds,
-            preferred_angles=bounded_seed,
-            joint_lower=limits.position_min,
-            joint_upper=limits.position_max,
-            orientation_tolerance_rad=2e-4,
-            position_tolerance_m=2e-4,
-            max_iterations=250,
-            max_step_rad=0.15,
-        )
-        if not result.converged:
-            return None, f"IK projection failed at {'grasp' if len(anchors) == 0 else 'place'}"
-        anchors.append(result.joint_angles)
-    trajectory = build_expert_trajectory(np.zeros(JOINT_COUNT), anchors[0], anchors[1])
     review = review_tcp_positions(trajectory_tcp_positions(model, trajectory), scene)
     if not review.safe:
         return None, "projected trajectory violates diagnostic scene clearance"
@@ -513,10 +751,17 @@ def evaluate_model(checkpoint_path: Path, dataset_path: Path, output_path: Path,
         raise ValueError(
             f"checkpoint architecture is {found!r}; retrain with {ARCHITECTURE_NAME!r} before evaluation"
         )
+    if int(checkpoint.get("context_dim", -1)) != CONTEXT_DIM:
+        raise ValueError("checkpoint context dimension does not match the active multi-task model")
+    if tuple(checkpoint.get("task_names", ())) != TASK_NAMES:
+        raise ValueError("checkpoint task suite does not match the active multi-task benchmark")
     model = build_denoiser(int(checkpoint["hidden_dim"]), int(checkpoint["diffusion_steps"])).to(device)
     model.load_state_dict(checkpoint["state_dict"])
     data = np.load(dataset_path)
     contexts = data["contexts"]
+    task_ids = data["task_ids"] if "task_ids" in data.files else np.zeros(len(contexts), dtype=np.int8)
+    if len(task_ids) != len(contexts):
+        raise ValueError("dataset task_ids length does not match contexts")
     clean_grasp = data["clean_grasp_poses"]
     clean_place = data["clean_place_poses"]
     observed_grasp = data["observed_grasp_poses"]
@@ -536,23 +781,45 @@ def evaluate_model(checkpoint_path: Path, dataset_path: Path, output_path: Path,
     dispersion_abstentions = 0
     projection_failures: list[str] = []
     examples: list[dict[str, object]] = []
+    task_records: dict[str, dict[str, Any]] = {
+        task_name: {
+            "episodes": 0,
+            "raw_errors": [],
+            "raw_safe": 0,
+            "shielded_errors": [],
+            "shielded_safe": 0,
+            "abstentions": 0,
+            "ood_abstentions": 0,
+            "dispersion_abstentions": 0,
+            "projection_failures": 0,
+        }
+        for task_name in TASK_NAMES
+    }
     for index, context_np in enumerate(contexts):
+        task_name = task_name_from_id(int(task_ids[index]))
+        record = task_records[task_name]
+        record["episodes"] += 1
         context = torch.tensor(context_np, dtype=torch.float32)
         samples = sample_trajectories(model, context, int(checkpoint["diffusion_steps"]), samples_per_context, device)
         dispersion = float(np.mean(np.linalg.norm(samples[:, GRASP_INDEX] - samples[:, GRASP_INDEX].mean(axis=0), axis=1)))
         prediction = np.mean(samples, axis=0) * ASSUMED_JOINT_LIMIT_RAD
         prediction = np.clip(prediction, -ASSUMED_JOINT_LIMIT_RAD, ASSUMED_JOINT_LIMIT_RAD)
         raw_errors.append(pose_position_error(arm, prediction[GRASP_INDEX], clean_grasp[index]))
+        record["raw_errors"].append(raw_errors[-1])
         raw_review = review_tcp_positions(trajectory_tcp_positions(arm, prediction), scene)
         raw_scene_safe += int(raw_review.safe)
+        record["raw_safe"] += int(raw_review.safe)
         support_distance = float(np.linalg.norm((context_np.astype(np.float64) - context_mean) / context_std))
         if support_distance > support_threshold:
             abstentions += 1
             ood_abstentions += 1
+            record["abstentions"] += 1
+            record["ood_abstentions"] += 1
             if len(examples) < 8:
                 examples.append(
                     {
                         "index": index,
+                        "task": task_name,
                         "support_distance": support_distance,
                         "dispersion_rad": dispersion,
                         "decision": "abstain",
@@ -563,32 +830,58 @@ def evaluate_model(checkpoint_path: Path, dataset_path: Path, output_path: Path,
         if dispersion > abstain_dispersion_rad:
             abstentions += 1
             dispersion_abstentions += 1
+            record["abstentions"] += 1
+            record["dispersion_abstentions"] += 1
             if len(examples) < 8:
-                examples.append({"index": index, "dispersion_rad": dispersion, "decision": "abstain", "reason": "sample dispersion above threshold"})
+                examples.append({"index": index, "task": task_name, "dispersion_rad": dispersion, "decision": "abstain", "reason": "sample dispersion above threshold"})
             continue
-        projected, failure = project_with_constraints(prediction, observed_grasp[index], observed_place[index], scene)
+        projected, failure = project_with_constraints(prediction, observed_grasp[index], observed_place[index], scene, task_name)
         if projected is None:
             projection_failures.append(failure or "unknown")
+            record["projection_failures"] += 1
             if len(examples) < 8:
-                examples.append({"index": index, "dispersion_rad": dispersion, "decision": "projection_failed", "reason": failure})
+                examples.append({"index": index, "task": task_name, "dispersion_rad": dispersion, "decision": "projection_failed", "reason": failure})
             continue
         shielded_errors.append(pose_position_error(arm, projected[GRASP_INDEX], clean_grasp[index]))
         shielded_scene_safe += 1
+        record["shielded_errors"].append(shielded_errors[-1])
+        record["shielded_safe"] += 1
         if len(examples) < 8:
             examples.append(
                 {
                     "index": index,
+                    "task": task_name,
                     "dispersion_rad": dispersion,
                     "decision": "projected_safe",
                     "raw_grasp_error_m": raw_errors[-1],
                     "shielded_grasp_error_m": shielded_errors[-1],
                 }
             )
+    task_metrics = {}
+    for task_name, record in task_records.items():
+        episodes = int(record["episodes"])
+        if not episodes:
+            continue
+        task_metrics[task_name] = {
+            "episodes": episodes,
+            "raw_mean_grasp_position_error_m": float(np.mean(record["raw_errors"])),
+            "raw_scene_safe_rate": record["raw_safe"] / episodes,
+            "shielded_mean_grasp_position_error_m": float(np.mean(record["shielded_errors"])) if record["shielded_errors"] else None,
+            "projected_safe_rate": record["shielded_safe"] / episodes,
+            "projection_success_rate": record["shielded_safe"] / max(1, episodes - record["abstentions"]),
+            "abstention_rate": record["abstentions"] / episodes,
+            "ood_abstention_rate": record["ood_abstentions"] / episodes,
+            "dispersion_abstention_rate": record["dispersion_abstentions"] / episodes,
+            "projection_failure_rate": record["projection_failures"] / episodes,
+        }
     report = {
         "evaluation": "constraint_diffusion_digital_twin",
         "architecture": ARCHITECTURE_NAME,
         "context_tokens": list(CONTEXT_TOKEN_NAMES),
+        "task_suite": list(TASK_NAMES),
+        "task_metrics": task_metrics,
         "action_chunk_length": TRAJECTORY_STEPS,
+        "model_parameters": int(checkpoint.get("model_parameters", 0)),
         "real_motion_enabled": False,
         "episodes": int(len(contexts)),
         "seed": seed,
@@ -618,6 +911,20 @@ def evaluate_model(checkpoint_path: Path, dataset_path: Path, output_path: Path,
     return report
 
 
+def parse_task_suite(value: str) -> tuple[str, ...]:
+    tasks = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not tasks:
+        raise argparse.ArgumentTypeError("task suite must include at least one task")
+    if len(set(tasks)) != len(tasks):
+        raise argparse.ArgumentTypeError("task suite must not contain duplicate task names")
+    try:
+        for task_name in tasks:
+            task_id_from_name(task_name)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return tasks
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -628,6 +935,8 @@ def main() -> int:
     generate.add_argument("--xy-sigma-m", type=float, default=0.003)
     generate.add_argument("--z-sigma-m", type=float, default=0.002)
     generate.add_argument("--yaw-sigma-deg", type=float, default=2.0)
+    generate.add_argument("--tasks", type=parse_task_suite, default=TASK_NAMES, help=f"comma-separated task profiles; defaults to {','.join(TASK_NAMES)}")
+    generate.add_argument("--domain-randomization", action="store_true", help="randomize declared visual noise and confidence per episode")
 
     train = subparsers.add_parser("train", help="train the conditional diffusion trajectory prior")
     train.add_argument("--dataset", type=Path, required=True)
@@ -650,7 +959,7 @@ def main() -> int:
     if args.command == "generate":
         result = generate_dataset(
             args.output,
-            DatasetSettings(args.count, args.seed, args.xy_sigma_m, args.z_sigma_m, args.yaw_sigma_deg),
+            DatasetSettings(args.count, args.seed, args.xy_sigma_m, args.z_sigma_m, args.yaw_sigma_deg, args.tasks, args.domain_randomization),
             load_diagnostic_scene(),
         )
     elif args.command == "train":

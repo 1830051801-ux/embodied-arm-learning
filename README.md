@@ -1,28 +1,51 @@
-# XiaoU Embodied Action-Chunk Transformer Digital Twin
+# XiaoU Multi-Task Factory-Cell Digital Twin
 
-Six-axis visual grasping, coordinate planning, and safety verification project for the XiaoU desktop robot arm. The repository combines YOLO-side target handoff, planar calibration, a POE/URDF-checked kinematic model, trajectory planning, CAN/UART protocol validation, ROS 2 planning entry points, and an offline embodied action-chunk Transformer diffusion policy.
+An offline six-axis manipulation benchmark that connects visual target handoff, task-conditioned action-chunk generation, kinematic projection, ROS 2 planning artifacts, and explicit hardware execution gates for the XiaoU desktop arm.
 
-![Embodied Action-Chunk Transformer dashboard](assets/constraint_diffusion_dashboard.png)
+![Multi-task factory-cell benchmark](assets/multitask_factory_cell_dashboard.png)
 
-## Why this project is different
+## Verified Capabilities
 
-- **Counterfactual demonstrations**: creates complete home-to-grasp-to-place trajectories from the checked-in six-axis POE model, with controlled vision pose and confidence perturbations.
-- **Embodied Action-Chunk Transformer**: encodes visual grasp pose, place goal, observation uncertainty, and a learned task token; a cross-attention decoder produces a complete `32 x 6` six-axis action chunk rather than one fixed endpoint action.
-- **Proposal-guided diffusion policy**: the learned 32-step proposal initializes a 16-step denoising process, preserving a structured trajectory prior instead of sampling arbitrary joint-space noise.
-- **Constraint projection safety shield**: uses multi-start IK, joint envelopes, TCP clearance against table/fixture keep-out boxes, and explicit failure reporting before accepting an offline plan preview.
-- **Support-domain abstention**: detects visual uncertainty outside the calibrated training support and requests recheck rather than treating a low-variance prediction as safe.
+- **Five task profiles**: transfer, two simulated placement zones, two-view inspection, and precision insertion with final dwell.
+- **Embodied Action-Chunk Transformer**: visual grasp pose, place goal, uncertainty metadata, a five-way task profile, and a learned task token are fused by a two-layer Transformer encoder. A three-layer cross-attention decoder produces a complete `32 x 6` joint action chunk.
+- **Proposal-guided diffusion**: a learned action-chunk proposal is refined over 16 denoising steps rather than sampling an unstructured joint trajectory from noise.
+- **Kinematics-grounded process stages**: each trajectory contains approach, contact, transfer, retreat, and task-specific dwell phases. Approach poses are created by Cartesian vertical offsets and solved with multi-start damped least-squares IK.
+- **Safety projection and abstention**: joint envelopes, visual-support distance, sample dispersion, task-region checks, IK recovery, and TCP clearance against table/fixture keep-out boxes gate every offline preview.
 
-The default `hidden_dim=96` model has 737,862 trainable parameters. In the checked-in offline experiment, the constraint projection reduced mean grasp endpoint error from **13.25 mm** to **4.30 mm** on a 128-episode nominal synthetic test. A higher-noise 128-episode shift test was rejected by the support gate. These are digital-twin results only, not real-arm performance claims.
+## Reproducible Multi-Task Benchmark
 
-This is an ACT-style action-chunk design for calibrated visual geometry, not a pretrained VLA or a claim of raw-image/language foundation-model capability.
+The checked-in dashboard was generated on the local CUDA environment with a 1,320,710-parameter `hidden_dim=128` policy.
+
+| Split | Episodes | Task balance | Visual condition |
+| --- | ---: | --- | --- |
+| Train | 4,096 | 820 transfer, 819 each remaining task | Per-episode domain randomization: 0.55-1.45x base noise; confidence 0.68-0.99 |
+| Nominal test | 640 | 128 per task | XY 3 mm, Z 2 mm, yaw 2 deg |
+| OOD test | 640 | 128 per task | XY 8 mm, Z 4 mm, yaw 5 deg |
+
+| Nominal metric | Result |
+| --- | ---: |
+| Raw-policy mean grasp endpoint error | 6.62 mm |
+| Constraint-projected mean grasp endpoint error | 4.18 mm |
+| Projected-safe coverage across all tasks | 82.34% |
+| High-noise OOD abstention across all tasks | 100.00% |
+
+The projected-safe rate is deliberately not presented as a real-arm success rate. It is the fraction of offline episodes that pass the checked-in task, IK, and TCP scene gates after a synthetic visual observation.
+
+## Simulation Evidence
+
+- Six-axis POE model is checked against the ROS 2 URDF: maximum screw-axis error `3.97e-9`, maximum home-transform error `1.00e-12`.
+- ROS 2 workspace includes robot description, collision/visual meshes, MoveIt configuration, perception entry points, and review-only launch paths.
+- MoveIt trajectory execution and the planner execution path remain disabled until measured calibration, limits, feedback, emergency stop, and explicit authorization exist.
 
 ```mermaid
 flowchart LR
-    V["Visual pose and uncertainty"] --> C["Context Transformer"]
-    C --> A["Cross-attention action decoder"]
+    V["YOLO / calibrated visual pose"] --> C["Grasp, goal, uncertainty and task tokens"]
+    C --> E["2-layer context Transformer"]
+    E --> A["3-layer cross-attention action decoder"]
     Q["32 action queries"] --> A
-    A --> D["Diffusion refinement"]
-    D --> S["IK and scene projection"]
+    A --> D["16-step diffusion refinement"]
+    D --> P["Multi-start IK and task process stages"]
+    P --> S["Joint, TCP and support-domain safety gates"]
 ```
 
 ## Quick Start
@@ -31,24 +54,25 @@ Core offline verification:
 
 ```powershell
 python -m unittest discover -s tests -v
+python -m compileall -q robot_ai tests tools
 python tools\verify_six_axis_stack.py
 ```
 
-Reproduce the constraint-diffusion experiment with a Python environment that includes PyTorch, NumPy, and Matplotlib:
+Reproduce the multi-task benchmark using a Python environment with PyTorch, NumPy, and Matplotlib:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\run_constraint_diffusion.ps1
 ```
 
-The workflow writes datasets, checkpoints, and reports under `runtime/`, which is intentionally ignored by Git. The publishable dashboard is stored at `assets/constraint_diffusion_dashboard.png`.
+Generated datasets, checkpoints, and reports remain under `runtime/` and are intentionally ignored by Git. The public benchmark dashboard is `assets/multitask_factory_cell_dashboard.png`.
 
-## Safety Boundary
+## Explicit Limits
 
-Every simulator and evaluation tool is offline. They do not open a CAN interface, serial port, ROS 2 hardware driver, or issue real-arm motion commands. Real motion remains blocked until measured calibration, joint IDs, encoder zero offsets, directions, limits, feedback, emergency stop, full-link collision review, and explicit authorization are available.
+This is an ACT-style action-chunk design for calibrated visual geometry. It is not a pretrained VLA, does not consume raw RGB or language instructions, and is not a certified industrial control system. The digital twin uses the checked-in POE model and TCP-only scene review; full-link collision, calibrated camera-to-base transforms, measured encoder offsets, force feedback, and real-arm validation remain required before physical motion.
 
 ## Documentation
 
 - [Chinese project guide](README_使用说明.md)
-- [Embodied Action-Chunk Transformer experiment note](docs/constraint_diffusion_digital_twin.md)
+- [Multi-task Transformer experiment note](docs/constraint_diffusion_digital_twin.md)
 - [Six-axis simulation review](docs/simulation_review_20260807.md)
 - [ROS 2 planning workspace](ros2_ws/)
